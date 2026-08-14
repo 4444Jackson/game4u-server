@@ -1,0 +1,17 @@
+services:
+  zombie-lan:
+    build: .
+    image: zombie-lan:latest
+    container_name: zombie-lan
+    restart: unless-stopped
+    # 直接把 8123 暴露到宿主机；若前面再套 nginx，可改成仅 127.0.0.1:8123:8123
+    ports:
+      - "8123:8123"
+    environment:
+      - PORT=8123
+      - TICK_HZ=30
+    # 小内存机器保护：异常时最多吃 768M，避免拖垮整机
+    deploy:
+      resources:
+        limits:
+          memory: 768M

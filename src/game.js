@@ -1,0 +1,1269 @@
+// game.js — Three.js 渲染 + 游戏模拟（主机权威 / 客户端渲染）
+import * as THREE from 'three';
+// 共享模拟核心：地形/碰撞/视线/寻路/僵尸AI 全部 import 同一份 map-core.js，
+// 与 sim-core.js（relay 权威）天然一致，杜绝两条路径手工镜像出错。
+import {
+  MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,
+  bulletWorld, pickZombieKind, ZSTAT, stepZombie
+} from '../map-core.js';
+import { makeConfig, computeStats, talentTotalCost } from '../gameConfig.js';
+
+// ---- 调参 ----
+const PLAYER_OBS_R = 0.6;    // 玩家碰撞方块半边长基准（= 可视方块底面 1.2 / 2；OBB 随瞄准转）。实战半径 = 此值 × 受击面积缩放
+const SUPPORT_R = 0.25;      // 站立支撑判定半径（必须 < PLAYER_OBS_R，防止贴墙瞬移上顶）
+const ZOMBIE_RADIUS = 0.9;   // 僵尸碰撞方块半边长（轴对齐，不随转向）
+const BULLET_RADIUS = 0.12;  // 与可视方块 0.24 见方一致（所见即碰撞）
+const BULLET_LIFE = 1.3;
+const BULLET_EYE = 1.6;      // 出膛高度 = 射手脚底 + 1.6（与相机眼睛同高：视角即弹道，无视差）
+const ZOMBIE_SPEED = 4.4;
+const ZOMBIE_DMG = 9;
+const DEFAULT_WAVE_TARGET = 100;  // 僵尸浪潮默认击杀目标（房主可改；0 = 无限/无尽生存）
+const MAX_ZOMBIES = 22;
+const SPAWN_INTERVAL = 1.1;
+const DEFAULT_LIVES = 3;     // 对战模式默认命条数（房主可改；僵尸浪潮固定 1）
+const RESPAWN_TIME = 2.5;    // 死亡后重生倒计时(秒)
+const GRAVITY = 24;          // 重力加速度(m/s²)
+const JUMP_BUFFER = 0.15;    // 跳跃缓冲：按下后记住 0.15s，落地/coyote 窗口内才起跳
+const COYOTE = 0.10;         // 土狼时间：离地后 0.10s 内仍可起跳（走下箱顶边缘不卡）
+const VISUAL_H = 1.8;        // 玩家可视方块高度（用于子弹命中高度判定；随缩放同步）
+
+const PALETTE = [0x4f9bff, 0xff9f43, 0x2ecc71, 0xff5e7e, 0xb56bff, 0x46d6d6];
+
+// 内置默认建模（离线/mod.json 加载失败时的兜底）：纯色方块，不依赖任何贴图文件。
+// 三种僵尸各自配色，仅靠方块也能区分类型（walker 绿 / seeker 橙 / flyer 紫带翼盘）。
+const DEFAULT_MOD = {
+  // 「我的世界头颅」式单一方块：底面边长=贴墙碰撞直径（玩家1.2/僵尸1.8），可视体积=碰撞体积
+  player: { tintByPlayer: true, parts: [
+    { size: [1.2, 1.8, 1.2], pos: [0, 0.9, 0], color: '#4f9bff', roughness: 0.55, metalness: 0.1 },
+    // 头发：史蒂夫式深色发盖，坐在头顶上方（不重叠脚本体，避免 z-fighting），noTint 保持自身颜色
+    { size: [1.18, 0.30, 1.18], pos: [0, 1.95, 0], color: '#3b2a1a', noTint: true, roughness: 0.9, metalness: 0.0 }
+  ]},
+  zombie_walker: { parts: [
+    { size: [1.8, 1.55, 1.8], pos: [0, 0.775, 0], color: '#6fae4f', roughness: 0.85, metalness: 0.0 }
+  ]},
+  zombie_seeker: { parts: [
+    { size: [1.8, 1.6, 1.8], pos: [0, 0.8, 0], color: '#d98b3a', roughness: 0.8, metalness: 0.05 }
+  ]},
+  zombie_flyer: { parts: [
+    { size: [1.8, 1.2, 1.8], pos: [0, 0.6, 0], color: '#8e6bd6', roughness: 0.5, metalness: 0.2 }
+  ]},
+  zombie: { parts: [  // 兜底（无 k 字段时）
+    { size: [1.8, 1.55, 1.8], pos: [0, 0.775, 0], color: '#6fae4f', roughness: 0.85, metalness: 0.0 }
+  ]},
+  bullet: { parts: [
+    { size: [0.24, 0.24, 0.24], pos: [0, 0, 0], color: '#fff2a0', emissive: '#ffd000', emissiveIntensity: 1.4 }
+  ]}
+};
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+export class Game {
+  constructor(canvas) {
+    this.canvas = canvas;
+    // U4/Quarkium（夸克、UC）内核上关抗锯齿并声明不透明：官方《U4内核的游戏模式》推荐的上下文参数
+    // （alpha:false 免去与页面背景的额外合成，antialias:false 省掉一遍多重采样解析）。
+    // 标准 Chromium（Edge/Chrome/vivo 自带）保持 antialias:true 原画质，完全不受影响。
+    const _u4 = (() => { try { return /Quark|UCBrowser|UCWEB/i.test(navigator.userAgent || ''); } catch (_) { return false; } })();
+    // U4 官方「游戏模式」：必须自己用 gameMode:true 建上下文（Three 不认这个非标准属性，
+    // 故先手动 getContext 再把 context 交给 Three）。官方要求：全屏不透明 canvas、
+    // 每帧绘制完调 gl.submit() 提交帧。是否真开成功只能问 getContextAttributes().gameMode，
+    // 开不成就自动退回普通上下文——不影响标准内核，也不影响 U4 上的正常渲染。
+    let _ctx = null, _gameMode = false;
+    if (_u4) {
+      const attrs = { alpha: false, antialias: false, depth: true, stencil: true, powerPreference: 'high-performance', gameMode: true };
+      try { _ctx = canvas.getContext('webgl2', attrs) || canvas.getContext('webgl', attrs); } catch (_) { _ctx = null; }
+      if (_ctx) {
+        try { _gameMode = !!(_ctx.getContextAttributes() || {}).gameMode; } catch (_) { _gameMode = false; }
+      }
+    }
+    this._gl = _ctx;
+    this._gameMode = _gameMode;
+    this.renderer = new THREE.WebGLRenderer(_ctx
+      ? { canvas, context: _ctx, antialias: false, alpha: false, powerPreference: 'high-performance' }
+      : (_u4 ? { canvas, antialias: false, alpha: false, powerPreference: 'high-performance' }
+             : { canvas, antialias: true }));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x87ceeb);   // 蓝天（sky blue）
+    this.scene.fog = new THREE.Fog(0x87ceeb, 60, 170);    // 雾色=天色，远处自然融入天空
+
+    this.camera = new THREE.PerspectiveCamera(70, 1, 0.1, 400);
+    this.camera.position.set(0, 1.6, 0);
+    // 第一人称不挂任何手臂/枪模型：角色建模是纯方块，视角里保持干净（准星即弹道）
+    this.scene.add(this.camera);
+
+    this._buildWorld();
+
+    this.playerMeshes = new Map();
+    this.zombieMeshes = new Map();
+    this.bulletMeshes = new Map();
+
+    this.myId = 'host';
+    this.state = this._emptyState();
+    this.config = makeConfig();   // 权威配置：主机模式房主可覆盖；客户端模式随快照同步（预测同口径的关键）
+
+    this.snaps = [];            // 客户端插值缓冲：最近若干快照 {t, snap}
+    this.clientInterp = false;  // 收到快照后进入客户端插值模式
+    this.myPitch = 0;           // 本地玩家俯仰角(pitch)，由 Controls 喂入，仅用于第一人称相机，无服务器参与
+    this.myYaw = null;          // 本地玩家瞬时水平朝向(yaw)，由 Controls 喂入：相机零延迟跟手，准星即弹道
+
+    // ---- 本地预测（client-side prediction）----
+    // 本地玩家的移动/跳跃在客户端用与服务器完全相同的 map-core 代码即时模拟（零延迟跟手）。
+    // 关键：预测用「固定 1/60 步长」(predictTick 累加器) 与服务器消费指令的口径逐条对齐，
+    // 双端同一份 _stepPredCmd / _stepPlayerOnce 逻辑 → 碰撞解算逐位一致 → 重放不发散。
+    this.pred = null;           // 预测状态 {x,z,y,vy,grounded,jumpBuf,coyoteT,fireCd}；null=尚未开始/交回服务器权威
+    this.predInput = null;      // 当前输入状态（每渲染帧由 main.js 喂入，predictTick 切成指令）
+    this.predHist = [];         // 预测位置短史 {t,x,z,y}（保留供调试/统计发散量）
+    this._lastRT = 0;           // 上一渲染帧时间戳（预测步长 dt 来源）
+    this._predAcc = 0;          // 预测固定步长累加器（1/60，与服务器逐条消费指令同口径）
+    this._simT = 0;             // 累计模拟时间(s)，预测状态带时间戳用于渲染延迟插值
+    this._predStates = [];      // 预测状态缓冲 [{t,x,z,y}]（带 sim 时间戳，渲染时按 now-延迟 取包围段插值）
+
+    // ---- 指令流 + 回滚重放（现代 FPS 同步；替代旧"平滑回拉"对账）----
+    // 每个预测步生成一条带 seq 的指令 → 本地立即模拟 → 存未确认队列 → 批量上行；
+    // 服务器按 seq 逐条精确模拟并回传 ack；收到快照后回滚到快照运动学状态、丢弃 seq≤ack、
+    // 重放剩余未确认指令。模拟确定性 ⇒ 重放结果与预测逐位一致 ⇒ 零回拉。
+    this._cmdSeq = 0;           // 指令序号（单调递增）
+    this._unacked = [];         // 未确认指令队列 [{seq,mx,mz,ax,az,pitch,fire,jump}]
+    this._pendingCmds = [];     // 本帧新生成、待上行的指令
+    this._jumpLatch = false;    // 跳跃边沿锁存（见 feedLocalInput：防高帧率下按跳被下一帧覆盖吞掉）
+    this.onCmds = null;         // main.js 注入：cmds → net.send({type:'input', cmds})
+
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+
+    // ---- 建模资源（MOD 化）：实体外观由 public/assets/entities/mod.json + 贴图驱动 ----
+    this.assetBase = new URL('assets/entities/', document.baseURI).href;
+    this.entityMod = null;
+    this._texCache = {};
+    this._loadEntityMod();
+
+  }
+
+  _emptyState() {
+    return {
+      players: {},
+      zombies: [],
+      bullets: [],
+      obstacles: [],       // 障碍物 [{x,z,w,d,t}] t=高度档位(×STEP)
+      grid: null,          // 寻路网格（不入快照）
+      bounce: false,       // 房主设定：子弹撞墙/障碍是否反弹
+      zmix: 'progress',    // 僵尸出现方式：'progress' 随进度逐步引入 | 'mix' 全程混出
+      score: 0,
+      target: DEFAULT_WAVE_TARGET,
+      status: 'waiting',
+      mode: 'wave',        // 'wave' 僵尸浪潮 | 'versus' 对战（无僵尸）
+      livesMax: 1,         // 对战模式：每位玩家的基础命条数（房主设定，不含天赋命数加成）
+      winner: null,        // 对战模式：恒为 null（已不再判个人胜者，结束统称"本局结束"）
+      nextZid: 1,
+      nextBid: 1,
+      spawnCd: 0,
+      matchTime: 0,        // 本局已进行秒数（时间上限判定）
+      nextEventId: 1,
+      events: [],          // 击杀事件滚动日志（id/killer/victim/t）
+    };
+  }
+
+  _buildWorld() {
+    const hemi = new THREE.HemisphereLight(0xcfe6ff, 0x8f9aa5, 0.95); // 白天环境光：天光偏蓝、地面反光亮灰（配合蓝天，不再是夜色）
+    this.scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.15);
+    dir.position.set(22, 42, 18);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(1024, 1024);
+    const d = 52;
+    const c = dir.shadow.camera;
+    c.left = -d; c.right = d; c.top = d; c.bottom = -d; c.near = 1; c.far = 130;
+    this.scene.add(dir);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(MAP * 2, MAP * 2),
+      new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.95, metalness: 0.0 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    this.scene.add(ground);
+
+    const grid = new THREE.GridHelper(MAP * 2, MAP, 0x6b7280, 0x9aa3ad);
+    grid.position.y = 0.02;
+    this.scene.add(grid);
+
+    // 边界围墙：6m 高砖纹混凝土墙（程序生成砖缝贴图），走到边上一眼就知道“此路不通”
+    // 注意：BoxGeometry 必须用 (w, wallH, dpt)——旧代码深度写死 t 导致东西两侧墙变成 1×3×1 小柱子（隐形墙 bug）
+    const brickCanvas = document.createElement('canvas');
+    brickCanvas.width = 128; brickCanvas.height = 128;
+    {
+      const g = brickCanvas.getContext('2d');
+      g.fillStyle = '#a7adb5'; g.fillRect(0, 0, 128, 128);          // 混凝土底色（亮灰，白天光下清晰）
+      g.strokeStyle = '#7e848c'; g.lineWidth = 5;                    // 砖缝
+      for (let y = 0; y <= 128; y += 32) { g.beginPath(); g.moveTo(0, y); g.lineTo(128, y); g.stroke(); }
+      for (let r = 0; r < 4; r++) {
+        const off = (r % 2) ? 32 : 0;
+        for (let x = off; x <= 128; x += 64) { g.beginPath(); g.moveTo(x, r * 32); g.lineTo(x, r * 32 + 32); g.stroke(); }
+      }
+    }
+    const wallH = 6, t = 1, S = MAP;
+    const mkWall = (w, dpt, x, z) => {
+      const tex = new THREE.CanvasTexture(brickCanvas);
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(Math.max(w, dpt) / 4, wallH / 4);              // 砖块约 2×1m，沿墙长重复
+      const mat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95, metalness: 0 });
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, wallH, dpt), mat);
+      m.position.set(x, wallH / 2, z);
+      m.castShadow = true; m.receiveShadow = true;
+      this.scene.add(m);
+    };
+    mkWall(S * 2 + t, t, 0, -S); mkWall(S * 2 + t, t, 0, S);
+    mkWall(t, S * 2 + t, -S, 0); mkWall(t, S * 2 + t, S, 0);
+
+    // 障碍物容器：每局地形重随机后由 _rebuildObstacles 重建
+    this.obstacleGroup = new THREE.Group();
+    this.scene.add(this.obstacleGroup);
+  }
+
+  // 按 map-core 的障碍物数据重建实体方块（高度 = 档位 × STEP）
+  _rebuildObstacles(obs) {
+    if (!this.obstacleGroup) return;
+    for (const ch of [...this.obstacleGroup.children]) {
+      this.obstacleGroup.remove(ch);
+      ch.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+    }
+    const mat = new THREE.MeshStandardMaterial({ color: 0xd1493f, roughness: 0.85, metalness: 0.05 });
+    for (const o of (obs || [])) {
+      const h = o.t * STEP;
+      const m = new THREE.Mesh(new THREE.BoxGeometry(o.w, h, o.d), mat);
+      m.position.set(o.x, h / 2, o.z);
+      m.castShadow = true; m.receiveShadow = true;
+      this.obstacleGroup.add(m);
+    }
+  }
+
+  resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+  }
+
+  // ---------- 建模资源（MOD 化） ----------
+  // 实体外观完全由 public/assets/entities/mod.json + 贴图决定。
+  // fetch 失败（如离线 APK 缺资源）时回退到内置 DEFAULT_MOD，保证总能渲染。
+  async _loadEntityMod() {
+    try {
+      const res = await fetch(this.assetBase + 'mod.json');
+      if (res.ok) {
+        this.entityMod = await res.json();
+        this._collectTextures();
+        this._clearMeshes(); // 用新配置重建已有网格
+      }
+    } catch (e) {
+      console.warn('[assets] mod.json 加载失败，使用内置默认建模', e);
+    }
+  }
+
+  _collectTextures() {
+    const mod = this.entityMod;
+    if (!mod) return;
+    for (const type in mod) {
+      // 僵尸贴图延迟到实际生成僵尸网格时再加载（见 _buildEntityFor→_loadTexture）：
+      // 这样对战模式（无僵尸）永远不会去 fetch 僵尸贴图，实现按模式资源隔离。
+      if (type.startsWith('zombie')) continue;
+      const cfg = mod[type];
+      if (!cfg || !cfg.parts) continue;
+      for (const part of cfg.parts) if (part.texture) this._loadTexture(part.texture);
+    }
+  }
+
+  _loadTexture(name) {
+    const url = this.assetBase + name;
+    if (this._texCache[url]) return this._texCache[url];
+    const tex = new THREE.TextureLoader().load(url);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = 4;
+    this._texCache[url] = tex;
+    return tex;
+  }
+
+  _buildMaterial(part, tint) {
+    const opts = { roughness: part.roughness ?? 0.6, metalness: part.metalness ?? 0.1 };
+    if (part.texture) {
+      opts.map = this._loadTexture(part.texture);
+      opts.color = 0xffffff; // 颜色由贴图决定
+    } else {
+      opts.color = part.color ? new THREE.Color(part.color) : new THREE.Color(0x888888);
+    }
+    if (tint) opts.color = new THREE.Color(tint); // 玩家按个人调色板着色
+    if (part.emissive) {
+      opts.emissive = new THREE.Color(part.emissive);
+      opts.emissiveIntensity = part.emissiveIntensity ?? 1.0;
+    }
+    return new THREE.MeshStandardMaterial(opts);
+  }
+
+  _makeBoxPart(part, tint) {
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(part.size[0], part.size[1], part.size[2]),
+      this._buildMaterial(part, tint)
+    );
+    mesh.position.set(part.pos?.[0] || 0, part.pos?.[1] || 0, part.pos?.[2] || 0);
+    mesh.castShadow = true;
+    return mesh;
+  }
+
+  // 按类型构建实体：composed of box parts（正方体建模）
+  // typeKey 显式指定，便于僵尸按 k 选不同建模条目（zombie_walker/seeker/flyer）
+  _buildEntityFor(typeKey, tint) {
+    const cfg = (this.entityMod && this.entityMod[typeKey]) || DEFAULT_MOD[typeKey] || DEFAULT_MOD.zombie;
+    const g = new THREE.Group();
+    const parts = (cfg && cfg.parts) || DEFAULT_MOD.zombie.parts;
+    const useTint = tint && cfg && cfg.tintByPlayer;
+    for (const part of parts) {
+      // noTint 部件（如玩家头发）保持自身颜色，不被玩家调色板染色
+      const t = (useTint && !part.noTint) ? tint : null;
+      g.add(this._makeBoxPart(part, t));
+    }
+    return g;
+  }
+
+  _playerMesh(color) { return this._buildEntityFor('player', color); }
+  _zombieMesh(k) {
+    // 按僵尸类型选择建模条目；缺省回退到 zombie
+    const key = (k === 'walker' || k === 'seeker' || k === 'flyer') ? ('zombie_' + k) : 'zombie';
+    return this._buildEntityFor(key, null);
+  }
+  _bulletMesh() { return this._buildEntityFor('bullet', null); }
+
+  // ---------- 主机：初始化 / 玩家管理 ----------
+  hostInit(hostName = '主机') {
+    this.state = this._emptyState();
+    this.config = makeConfig();
+    this.myId = 'host';
+    this.state.players['host'] = this._mkPlayer('host', hostName, PALETTE[0]);
+    this._clearMeshes();
+  }
+
+  // 房主覆盖配置（任意子集）；在 startGame 前调用
+  setConfig(overrides) {
+    this.config = makeConfig(overrides);
+    if (this.state) this.state.config = this.config;   // HUD/天赋面板读 state.config（两条路径同口径）
+    return this.config;
+  }
+
+  _mkPlayer(id, name, color) {
+    return {
+      id, name, color, x: (Math.random() * 2 - 1) * 10, z: (Math.random() * 2 - 1) * 10,
+      y: 0, vy: 0, grounded: true,
+      jumpBuf: 0, coyoteT: 0,   // 跳跃缓冲 / 土狼时间（主机镜像 sim-core）
+      hp: 100, maxHp: 100, aim: 0, alive: true,
+      // 连接态(state) 与 生命态(out/alive) 正交（镜像 sim-core，两条权威路径必须一致）：
+      //   state: 1=在线（默认初值） 0=离线（WS 断/主动退出，不区分、不超时、随时可回）
+      //   out  : true=本局命数耗尽永久出局（唯一参与"本局是否结束"的标记）
+      state: 1, out: false,
+      // ready: 天赋"配好没配好"的唯一标志位（镜像 sim-core）。0=没配/要重配，1=配好了。
+      //   置 0：离线 / 阵亡 / 开局 / 回等待房；置 1：点「✔ 配好了」
+      ready: 0,
+      lives: 1, respawnCd: 0,   // 对战模式：剩余命数 / 死亡重生倒计时
+      input: { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false }, fireCd: 0, kills: 0,
+      talent: { atk: 0, def: 0, spd: 0, size: 0, lives: 0 },  // 天赋等级（开局前由玩家分配）
+      stats: null,   // 派生实战数值（startGame 时按 config+talent 计算）
+      radius: PLAYER_OBS_R,   // 碰撞半径（含受击面积缩放）
+    };
+  }
+
+  // 玩家分配天赋（开局前）。校验不超过点数；越界忽略。
+  setTalent(id, talent) {
+    const p = this.state.players[id];
+    if (!p) return;
+    const t = { atk: 0, def: 0, spd: 0, size: 0, lives: 0 };
+    for (const k in t) t[k] = Math.max(0, Math.min(talent && talent[k] | 0, this.config.TALENT.maxLevel));
+    if (talentTotalCost(t) > this.config.TALENT.pointsPerPlayer) return;
+    p.talent = t;
+    // 立即按新天赋重算实战数值，使天赋在「等待房 / 复活窗口」分配后即时生效，
+    // 不必等到 startGame / 复活（修复「天赋要死一次才发挥作用」「有时开局不生效」的竞态）
+    const st = computeStats(this.config, p.talent);
+    p.stats = st;
+    p.radius = PLAYER_OBS_R * st.scale;
+  }
+
+  hostAddPlayer(id, name) {
+    const color = PALETTE[Object.keys(this.state.players).length % PALETTE.length];
+    const p = this._mkPlayer(id, name, color);
+    // 晚加入（镜像 relay.joinRoom 语义）：房间进行中 → 以「死亡→复活倒计时」进入，
+    // 给一次天赋配置机会，而非满血直接参战；命数与在场者一致（0 = 无限命）
+    if (this.state.status === 'playing') {
+      p.alive = false;
+      p.respawnCd = RESPAWN_TIME;
+      p.lives = this.state.livesMax;
+    }
+    this.state.players[id] = p;
+  }
+
+  // 离线（镜像 sim-core.setOffline）：不删对象，只从图上移除存在；命数/杀数/天赋全保留
+  hostSetOffline(id) {
+    const p = this.state.players[id];
+    if (!p || p.state === 0) return;
+    p.state = 0;
+    p.alive = false;
+    p.respawnCd = 0;
+    p.ready = 0;   // 离线即作废"配好了"：回来时面板自动重弹
+    p.vy = 0; p.grounded = true; p.jumpBuf = 0; p.coyoteT = 0; p.fireCd = 0;
+    p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
+    p.cmdQueue = []; p.lastAckSeq = 0; p.useCmdStream = false;
+  }
+
+  // 上线/重连（镜像 sim-core.setOnline）：当刷进来，随机撒点满血入场；已 out 者只回旁观
+  hostSetOnline(id) {
+    const p = this.state.players[id];
+    if (!p) return;
+    p.state = 1;
+    p.cmdQueue = []; p.lastAckSeq = 0; p.useCmdStream = false;
+    p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
+    p.respawnCd = 0;
+    const st = computeStats(this.config, p.talent);
+    p.stats = st;
+    p.radius = PLAYER_OBS_R * st.scale;
+    if (p.out) { p.alive = false; return; }
+    p.maxHp = this.config.COMBAT.baseHP;
+    p.hp = p.maxHp; p.alive = true;
+    p.y = 0; p.vy = 0; p.grounded = true; p.jumpBuf = 0; p.coyoteT = 0; p.fireCd = 0;
+    p.x = (Math.random() * 2 - 1) * 10;
+    p.z = (Math.random() * 2 - 1) * 10;
+    p.aim = 0;
+  }
+
+  // 真删：仅用于销毁/清空房间（正常掉线走 hostSetOffline，否则对战人数分母塌陷）
+  hostPurgePlayer(id) {
+    delete this.state.players[id];
+  }
+
+  // ---- 房间级：pid 席位认领 / ready 门槛（情景1 手机主机；与 relay.cjs 的 room.pids/room.ready 同构）----
+  // pid = 客户端 localStorage 里的持久身份，重连时凭它认领原席位（命数/杀数/天赋原样接回）
+  hostClaimSeat(pid) {
+    if (!pid || !this._pids) return null;
+    const cid = this._pids.get(pid);
+    const p = cid ? this.state.players[cid] : null;
+    // 接管(takeover)：pid 命中即认领该席位，不论它当前是否在线。
+    // 不再要求 state===0——旧连接可能还活着（刷新/同 pid 第二标签页/抖动重连快于旧 socket 关闭），
+    // 此时若"当新人"会开第二个席位 → "两个自己"的 bug。命中即接管那个 cid，旧连接由上层标 stale 防重复 detach。
+    return p ? cid : null;
+  }
+  hostBindPid(pid, cid) {
+    if (!this._pids) this._pids = new Map();
+    if (pid) this._pids.set(pid, cid);
+  }
+  hostRoster() {
+    return Object.values(this.state.players).filter((p) => p.state === 1);
+  }
+  // ready 标志位写在玩家对象上（镜像 sim-core.setReady）：不再另维护一份 Set，
+  // 免得"房间层名单"与"玩家标志位"两处口径打架
+  hostSetReady(cid, v) {
+    const p = this.state.players[cid];
+    if (p) p.ready = (v === false) ? 0 : 1;
+  }
+  // 对战开局门槛：在线 ≥2 人且全员 ready。wave 不设门槛（单人开荒合法）
+  hostVersusCanStart() {
+    const r = this.hostRoster();
+    if (r.length < 2) return false;
+    return r.every((p) => p.ready === 1);
+  }
+
+  // 房主点击「开始游戏」：mode='wave'(僵尸浪潮) | 'versus'(对战，无僵尸)
+  // lives：对战强制 ≥1；僵尸浪潮允许 0 = 无限命（死亡后重生）。target：0 = 无限击杀（无尽生存）
+  // opts = { bounce, zmix, target, config }：子弹反弹开关 / 僵尸出现方式 / 击杀目标 / 房主配置覆盖
+  startGame(mode, lives, opts) {
+    const o = opts || {};
+    const s = this.state;
+    if (o.config) this.setConfig(o.config);
+    s.mode = (mode === 'versus') ? 'versus' : 'wave';
+    // 命数缺省：对战按 ROOM.baseLives（需求文档变量）；僵尸浪潮沿用原默认 1（不受对战配置影响）
+    let lv;
+    if (lives === undefined || lives === null) lv = (mode === 'versus') ? this.config.ROOM.baseLives : 1;
+    else lv = lives | 0;
+    s.livesMax = Math.max(0, lv);   // 两种模式统一：0 = 无限命（死亡后自动重生，永不出局）
+    s.winner = null;
+    s.bounce = !!o.bounce;
+    s.zmix = o.zmix === 'mix' ? 'mix' : 'progress';
+    let t = DEFAULT_WAVE_TARGET;
+    if (o.target !== undefined && o.target !== null) t = o.target | 0;
+    s.target = t;
+    s.matchTime = 0;
+    s.events = [];
+    s.nextEventId = 1;
+    // 每局重新随机地形（离散高度档位障碍物）+ 重建寻路网格 + 重建障碍网格
+    s.obstacles = genObstacles(24);
+    s.grid = buildGrid(s.obstacles);
+    this._rebuildObstacles(s.obstacles);
+    for (const id in s.players) {
+      const p = s.players[id];
+      const st = computeStats(this.config, p.talent);
+      p.stats = st;
+      p.radius = PLAYER_OBS_R * st.scale;
+      p.maxHp = this.config.COMBAT.baseHP;
+      p.hp = p.maxHp;
+      // 命数 = 基础 + 天赋命数加成；基础 0 = 无限命（保持 0 标记，天赋加成不参与）
+      p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
+      p.out = false;            // 新一局：所有人清空出局标记
+      p.ready = 0;              // 新一局：标志位全清（镜像 sim-core.startGame）
+      p.respawnCd = 0;
+      p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
+      p.cmdQueue = []; p.lastAckSeq = 0;
+      p.fireCd = 0; p.kills = 0;
+      // 离线者：保持 state=0 不入场（命数已按新局发好），回来时由 hostSetOnline 刷进来
+      if (p.state === 0) { p.alive = false; continue; }
+      p.alive = true;
+      p.y = 0; p.vy = 0; p.grounded = true;
+      p.jumpBuf = 0; p.coyoteT = 0;
+      p.x = (Math.random() * 2 - 1) * 10;
+      p.z = (Math.random() * 2 - 1) * 10;
+      p.aim = 0;
+    }
+    s.zombies = []; s.bullets = []; s.score = 0;
+    s.spawnCd = 0.6; s.status = 'playing';
+  }
+
+  // 结算后「再来一局」→ 回空白等待房（镜像 sim-core.backToWaiting，复用建房入口）。
+  // 设计：房主不变、房间配置不变、原班玩家留房，但世界彻底重置为崭新空白局。
+  // 实现：抽走配置+花名册 → `this.state = this._emptyState()` 一刀切 → 填回配置与花名册。
+  backToWaiting() {
+    const s = this.state;
+    const kept = {
+      mode: s.mode, livesMax: s.livesMax, bounce: s.bounce,
+      zmix: s.zmix, target: s.target, config: this.config,
+    };
+    const roster = [];
+    for (const id in s.players) {
+      const p = s.players[id];
+      roster.push({ id, name: p.name, color: p.color, state: p.state, talent: p.talent });
+    }
+    this.state = this._emptyState();
+    const ns = this.state;
+    ns.mode = kept.mode; ns.livesMax = kept.livesMax; ns.bounce = kept.bounce;
+    ns.zmix = kept.zmix; ns.target = kept.target; this.config = kept.config;
+    for (const r of roster) {
+      const p = this._mkPlayer(r.id, r.name, r.color);
+      p.state = r.state;
+      p.talent = r.talent;                  // 天赋沿用上局（面板仍会弹，可改配）
+      if (r.state === 0) p.alive = false;   // 离线席位：保持不入场
+      ns.players[r.id] = p;
+    }
+    this._rebuildObstacles(ns.obstacles);   // 本地权威：障碍网格同步清空（等待房为空白地形）
+  }
+
+  // 击杀一名玩家（镜像 sim-core）：无限命(房间 livesMax===0)只进重生倒计时不扣命；否则扣 1 命，
+  // 仍有命则重生，命数耗尽 → out=true（永久出局）。
+  // ⚠️ 无限命判定看 livesMax 而非 p.lives<=0——后者与"有限命刚好扣到 0"二义，会让出局者反复重生。
+  _killPlayer(p) {
+    p.alive = false;
+    p.ready = 0;   // 阵亡即作废"配好了"：复活窗口内面板自动弹出（镜像 sim-core）
+    if (this.state.livesMax === 0) {
+      p.lives = 0;
+      p.respawnCd = RESPAWN_TIME;     // 无限命：死亡后重生，不扣命，永不 out
+    } else {
+      p.lives -= 1;
+      if (p.lives > 0) p.respawnCd = RESPAWN_TIME;
+      else { p.lives = 0; p.out = true; p.respawnCd = 0; }
+    }
+  }
+
+  hostSetInput(id, input) {
+    const p = this.state.players[id];
+    if (p) p.input = input;
+  }
+
+  // 主机：接收远端客户端的指令流（与 sim-core.queueCmds 完全同构）
+  hostQueueCmds(id, cmds) {
+    const p = this.state.players[id];
+    if (!p || !Array.isArray(cmds)) return;
+    if (!p.cmdQueue) { p.cmdQueue = []; p.lastAckSeq = 0; }
+    for (const c of cmds) {
+      const seq = c && c.seq | 0;
+      if (seq <= p.lastAckSeq) continue;
+      const tail = p.cmdQueue.length ? p.cmdQueue[p.cmdQueue.length - 1].seq : p.lastAckSeq;
+      if (seq <= tail) continue;
+      if (p.cmdQueue.length >= 120) p.cmdQueue.shift();
+      p.cmdQueue.push({
+        seq,
+        mx: +c.mx || 0, mz: +c.mz || 0,
+        ax: +c.ax || 0, az: +c.az || 0,
+        pitch: +c.pitch || 0,
+        fire: !!c.fire, jump: !!c.jump,
+      });
+    }
+    p.useCmdStream = true;
+  }
+
+  // ---------- 主机：模拟一帧 ----------
+  hostStep(dt) {
+    const s = this.state;
+    const obs = s.obstacles;
+    const FIRE_INTERVAL = 1 / this.config.COMBAT.fireRate;
+    const JUMP_V = this.config.COMBAT.jumpForce;
+
+    // 玩家移动 / 射击（waiting 与 playing 都执行：开局前双方可自由走位、预瞄）
+    for (const id in s.players) {
+      const p = s.players[id];
+      if (p.state === 0) continue;   // 离线：不在图上，完全不模拟（回来时 hostSetOnline 重新撒点）
+      if (!p.alive) {
+        // 死亡期间：确认掉积压指令（与 sim-core 同构，防复活被陈旧指令拖着跑）
+        if (p.cmdQueue && p.cmdQueue.length) {
+          p.lastAckSeq = p.cmdQueue[p.cmdQueue.length - 1].seq;
+          p.cmdQueue.length = 0;
+        }
+        continue;
+      }
+      if (p.useCmdStream) {
+        // 指令流远端玩家：逐条消费（每 tick 最多 3 条追积压；队列空不动）——与 sim-core 同构
+        let n = 0;
+        while (p.cmdQueue && p.cmdQueue.length && n < 3) {
+          const cmd = p.cmdQueue.shift();
+          p.input = cmd;
+          if (cmd.jump) p.jumpBuf = JUMP_BUFFER;
+          this._hostStepPlayerOnce(p, cmd, 1 / 60, obs, FIRE_INTERVAL, JUMP_V);
+          p.lastAckSeq = cmd.seq;
+          n++;
+        }
+        continue;
+      }
+      if (p.input && p.input.jump) p.jumpBuf = JUMP_BUFFER;   // 状态式（主机自己/旧客户端）：跳跃武装缓冲
+      this._hostStepPlayerOnce(p, p.input, dt, obs, FIRE_INTERVAL, JUMP_V);
+    }
+
+    this._hostStepWorld(dt);
+  }
+
+  // 主机：单玩家一步物理（指令流与状态式共用；与 sim-core._stepPlayerOnce 同构）
+  _hostStepPlayerOnce(p, inp, dt, obs, FIRE_INTERVAL, JUMP_V) {
+    {
+      let mx = inp.mx, mz = inp.mz;
+      const ml = Math.hypot(mx, mz);
+      if (ml > 1) { mx /= ml; mz /= ml; }
+      // 移动方向直接取输入瞄准向量(ax/az)，与 sim-core/客户端预测同口径（避免用陈旧 1 步的 p.aim 导致转向发散）
+      const aimX = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3) ? inp.ax : Math.sin(p.aim);
+      const aimZ = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3) ? inp.az : Math.cos(p.aim);
+      const sa = aimX, ca = aimZ;
+      const fwd = -mz, strafe = mx;
+      const dx = fwd * sa - strafe * ca;
+      const dz = fwd * ca + strafe * sa;
+      const spd = p.stats ? p.stats.moveSpeed : this.config.COMBAT.baseMoveSpeed;
+      const nx = clamp(p.x + dx * spd * dt, -MAP + 1, MAP - 1);
+      const nz = clamp(p.z + dz * spd * dt, -MAP + 1, MAP - 1);
+      // 体积/移动碰撞：圆柱（半径=基准×受击面积缩放，旋转无关、贴墙顺滑）；伤害判定另用 obbOverlap 严格方块
+      const mv = moveCircle(obs, p.x, p.z, nx, nz, p.radius || PLAYER_OBS_R, p.y);
+      p.x = mv.x; p.z = mv.z;
+      const sup = topAt(obs, p.x, p.z, SUPPORT_R);
+      // 跳跃缓冲 + 土狼时间（与 sim-core.step 同口径）
+      if (p.grounded) p.coyoteT = COYOTE;
+      else if (p.coyoteT > 0) p.coyoteT -= dt;
+      if (p.jumpBuf > 0 && (p.grounded || p.coyoteT > 0)) {
+        p.vy = JUMP_V; p.grounded = false; p.jumpBuf = 0; p.coyoteT = 0;
+      } else if (p.jumpBuf > 0) {
+        p.jumpBuf -= dt;
+      }
+      if (p.grounded && p.y > sup + 0.01) p.grounded = false;   // 走出箱顶边缘 → 下落
+      if (!p.grounded) {
+        p.vy -= GRAVITY * dt;
+        p.y += p.vy * dt;
+        if (p.y <= sup && p.vy <= 0) { p.y = sup; p.vy = 0; p.grounded = true; }
+      } else {
+        p.y = sup;
+      }
+      // 落地/移动兜底去穿透（与 sim-core 同逻辑）：落点在障碍里则顶出，杜绝伪卡死
+      depenetratePlayer(obs, p);
+      if (Math.hypot(inp.ax, inp.az) > 0.15) p.aim = Math.atan2(inp.ax, inp.az);
+      p.fireCd -= dt;
+      if (inp.fire && p.fireCd <= 0) {
+        p.fireCd = FIRE_INTERVAL;
+        this._spawnBullet(p);
+      }
+    }
+  }
+
+  // 主机：世界模拟（子弹/僵尸/重生/胜负）——与玩家步进解耦，每 tick 恒跑一次
+  _hostStepWorld(dt) {
+    const s = this.state;
+    const obs = s.obstacles;
+
+    // 子弹（含飞行高度 y 与撞墙/障碍反弹/消失）
+    for (let i = s.bullets.length - 1; i >= 0; i--) {
+      const b = s.bullets[i];
+      const px = b.x, pz = b.z;
+      b.x += b.vx * dt; b.z += b.vz * dt; b.y += (b.vy || 0) * dt; b.life -= dt;
+      const byaw = Math.atan2(b.vx, b.vz);   // 子弹朝向（沿飞行方向）
+      let hit = false;
+      if (s.mode === 'versus' && s.status === 'playing') {
+        // 对战：子弹命中其他存活玩家（OBB 精确接触 + 高度够得着，缩放同步）
+        for (const id in s.players) {
+          const p = s.players[id];
+          if (!p.alive || p.id === b.owner) continue;
+          const pr = p.radius || PLAYER_OBS_R;
+          if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, p.x, p.z, pr, pr, p.aim) &&
+              b.y > p.y - 0.2 && b.y < p.y + VISUAL_H * (p.stats ? p.stats.scale : 1) + 0.5) {
+            // 最终伤害 = max(攻击者单发伤害(含攻击天赋) - 受害者防御加成, 1)（与 sim-core 同公式）
+            const dmg = Math.max((b.dmg || this.config.COMBAT.baseDamage) - (p.stats ? p.stats.defense : 0), 1);
+            p.hp -= dmg; hit = true;
+            if (p.hp <= 0) {
+              p.hp = 0;
+              if (b.owner && s.players[b.owner]) {
+                s.players[b.owner].kills += 1;
+                s.events.push({ id: s.nextEventId++, killer: b.owner, victim: p.id, t: s.matchTime });
+                if (s.events.length > 12) s.events.shift();
+              }
+              this._killPlayer(p);
+            }
+            break;
+          }
+        }
+      } else {
+        // 僵尸浪潮：子弹命中僵尸（飞行僵尸按其飞行高度判定）
+        for (const z of s.zombies) {
+          const zy = z.y || 0;
+          if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, z.x, z.z, ZOMBIE_RADIUS, ZOMBIE_RADIUS, 0) &&
+              b.y > zy - 0.3 && b.y < zy + 2.0) {
+            z.hp -= 1; hit = true;
+            if (z.hp <= 0) {
+              z.dead = true; s.score += 1;
+              if (b.owner && s.players[b.owner]) s.players[b.owner].kills += 1;
+            }
+            break;
+          }
+        }
+      }
+      // 撞围墙/障碍：房主开了反弹则镜面反弹，否则消失
+      if (!hit && bulletWorld(obs, b, px, pz, s.bounce)) hit = true;
+      // 落地：低头打地面 → 消失（开反弹则向上弹起，与墙面镜面反弹一致）
+      if (!hit && b.y <= 0) {
+        if (s.bounce) { b.y = -b.y; b.vy = -(b.vy || 0); }
+        else hit = true;
+      }
+      if (hit || b.life <= 0) s.bullets.splice(i, 1);
+    }
+    s.zombies = s.zombies.filter((z) => !z.dead);
+
+    // 仅进入游戏(playing)后才生成僵尸并结算胜负；waiting 阶段只跑上面的移动/射击
+    if (s.status !== 'playing') return;
+
+    // 对战模式：累计计时（时间上限判定用）
+    if (s.mode === 'versus') s.matchTime += dt;
+
+    // 僵尸 AI（仅僵尸浪潮模式）：三类行为在 map-core.stepZombie 中实现
+    if (s.mode === 'wave') {
+      const ctx = { obs, grid: s.grid, players: s.players };
+      for (const z of s.zombies) {
+        const victim = stepZombie(z, dt, ctx);
+        if (victim) {
+          victim.hp -= ZOMBIE_DMG;
+          if (victim.hp <= 0) { victim.hp = 0; this._killPlayer(victim); }
+        }
+      }
+
+      // 生成
+      s.spawnCd -= dt;
+      if (s.spawnCd <= 0 && s.zombies.length < MAX_ZOMBIES) {
+        s.spawnCd = SPAWN_INTERVAL;
+        this._spawnZombie();
+      }
+    }
+
+    // 复活倒计时：死亡且处于重生倒计时中即重生（对战有限命 / 僵尸浪潮无限命都会触发）
+    for (const id in s.players) {
+      const p = s.players[id];
+      if (p.state === 0 || p.out) continue;   // 离线者不在图上、出局者不再复活
+      if (!p.alive && p.respawnCd > 0) {
+        p.respawnCd -= dt;
+        if (p.respawnCd <= 0) {
+          // 复活时按「当前天赋分配」重算实战数值（重装上阵：死亡等复活期间可重新调配天赋）
+          const st = computeStats(this.config, p.talent);
+          p.stats = st;
+          p.radius = PLAYER_OBS_R * st.scale;
+          p.hp = p.maxHp; p.alive = true;
+          p.y = 0; p.vy = 0; p.grounded = true;
+          p.jumpBuf = 0; p.coyoteT = 0;
+          p.x = (Math.random() * 2 - 1) * 10;
+          p.z = (Math.random() * 2 - 1) * 10;
+          p.aim = 0; p.fireCd = 0;
+        }
+      }
+    }
+
+    // 胜负
+    if (s.mode === 'versus') {
+      this._versusWin();
+    } else {
+      // 僵尸浪潮结束条件（无任何人数下限，单人开荒同样成立）：
+      //   胜 = 击杀达标；负 = 在线的人全部 out。离线者既不计入在场、也不触发判负。
+      const roster = Object.values(s.players).filter((p) => p.state === 1);
+      if (s.target > 0 && s.score >= s.target) s.status = 'win';   // 0 = 无限，不靠击杀获胜
+      else if (roster.length > 0 && roster.every((p) => p.out)) s.status = 'lose';
+    }
+  }
+
+  // 对战结束条件（与 sim-core._versusWin 完全同构）：只看「命数」和「时间」。
+  //   A. 命数淘汰（livesMax>0）：未 out 者 ≤1 → 结束；B. 限时到点 → 结束
+  // 铁律：不加「人数>=2」前置；离线(state=0) 不等于出局，熄屏的人 out 仍为 false，照样占分母。
+  _versusWin() {
+    const s = this.state;
+    const players = Object.values(s.players);
+    if (players.length === 0) return;
+    if (this.config.ROOM.timeLimit > 0 && s.matchTime >= this.config.ROOM.timeLimit * 60) {
+      s.status = 'win'; return;
+    }
+    if (s.livesMax > 0) {
+      const remain = players.filter((p) => !p.out);
+      if (remain.length <= 1) s.status = 'win';
+    }
+  }
+
+  _spawnBullet(p) {
+    // 视角即弹道：速度向量 = 视线单位向量(yaw+pitch) × 子弹速度，恒速直飞（无重力/加速度）
+    const a = p.aim;
+    const LIM = Math.PI / 2 - 0.05;   // 与相机 pitch 限位一致
+    const pitch = Math.max(-LIM, Math.min(LIM, (p.input && p.input.pitch) || 0));
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const speed = this.config.COMBAT.bulletSpeed;
+    const stat = p.stats || computeStats(this.config, p.talent);
+    this.state.bullets.push({
+      id: this.state.nextBid++,
+      x: p.x + Math.sin(a) * cp * 1.1, z: p.z + Math.cos(a) * cp * 1.1,   // 出膛点 = 眼睛沿视线前移 1.1m
+      y: p.y + BULLET_EYE + sp * 1.1,
+      vx: Math.sin(a) * cp * speed, vz: Math.cos(a) * cp * speed,
+      vy: sp * speed,
+      life: BULLET_LIFE, owner: p.id,
+      dmg: stat.damage,   // 预存攻击者单发伤害（含攻击天赋），命中时与受害者防御结算
+    });
+  }
+
+  _spawnZombie() {
+    const S = MAP - 1;
+    const edge = Math.floor(Math.random() * 4);
+    let x, z;
+    if (edge === 0) { x = -S + Math.random() * 2 * S; z = -S; }
+    else if (edge === 1) { x = -S + Math.random() * 2 * S; z = S; }
+    else if (edge === 2) { x = -S; z = -S + Math.random() * 2 * S; }
+    else { x = S; z = -S + Math.random() * 2 * S; }
+    const k = pickZombieKind(this.state.score, this.state.zmix);
+    const st = ZSTAT[k];
+    this.state.zombies.push({
+      id: this.state.nextZid++, k, x, z, y: 0,
+      hp: st.hp, speed: ZOMBIE_SPEED * st.spd * (0.85 + Math.random() * 0.4), atkCd: 0
+    });
+  }
+
+  hostSnapshot() {
+    const s = this.state;
+    // 本机主机不走 applySnapshot，HUD 直接读 this.state → canStart 必须回写进 state，
+    // 否则等待房「开始」按钮读到 undefined 恒被置灰，房主永远开不了对战。
+    s.canStart = (s.mode === 'versus') ? this.hostVersusCanStart() : true;
+    return {
+      type: 'state',
+      st: Date.now(),   // 主机发送时刻：客户端以此为插值时间轴（与 relay 路径同构，滤到达抖动）
+      mode: s.mode, livesMax: s.livesMax, winner: s.winner || null,
+      bounce: s.bounce,
+      config: this.config,         // 房主配置（timeLimit 等，客户端 HUD/预测同口径用）
+      matchTime: s.matchTime || 0,
+      events: (s.events || []).slice(),   // 击杀滚动日志
+      map: s.obstacles,   // 静态地形（客户端按内容变化重建网格模型）。APK 主机兼容：直连 LAN 的浏览器客户端仍从每帧快照取地形；relay 路径已改走独立 static、快照不含 map（此处为兼容例外）
+      // 离线玩家只发精简包（st:0，与 sim-core.snapshot 同构）：不在图上，位置/运动学一概不发，
+      // 客户端据此隐藏模型；名字/命数/杀数保留供战绩板与玩家列表显示"离线"席位
+      // ready 随每个玩家下发（与 sim-core.snapshot 同构）：客户端据此弹/收天赋面板、列未配好名单
+      players: Object.values(s.players).map((p) => (p.state === 0 ? {
+        id: p.id, name: p.name, color: p.color, on: 0,
+        lives: p.lives, kills: p.kills || 0, out: !!p.out, alive: false, ready: p.ready | 0,
+      } : {
+        on: 1, out: !!p.out, ready: p.ready | 0,
+        id: p.id, name: p.name, x: p.x, z: p.z, y: p.y, hp: p.hp, maxHp: p.maxHp,
+        ack: p.lastAckSeq || 0,   // 指令流：已模拟到的最后指令序号（与 sim-core.snapshot 同构）
+        vy: p.vy || 0, gr: p.grounded ? 1 : 0, jb: p.jumpBuf || 0, ct: p.coyoteT || 0, fcd: p.fireCd || 0,
+        aim: p.aim, alive: p.alive, color: p.color, kills: p.kills || 0,
+        lives: p.lives, respawnCd: p.respawnCd || 0,
+        scale: p.stats ? p.stats.scale : 1,
+        talent: p.talent
+      })),
+      zombies: s.zombies.map((z) => ({ id: z.id, k: z.k || 'walker', x: z.x, z: z.z, y: z.y || 0, hp: z.hp })),
+      bullets: s.bullets.map((b) => ({ id: b.id, x: b.x, z: b.z, y: b.y || 0 })),
+      canStart: s.canStart,   // 房间级状态（与 relay 广播同构）：客户端据此置灰"开始"按钮
+      score: s.score, target: s.target, status: s.status
+    };
+  }
+
+  // 静态数据一次性下发：仅建房/加入/接管/开局时由 relay 各发一次。
+  // 仅在此重建地形 + 存 config，不进每帧 applySnapshot 热路径（省 JSON.stringify + 省带宽）。
+  applyStatic(snap) {
+    if (!snap || typeof snap !== 'object') return;
+    const s = this.state;
+    if (snap.config) { this.config = snap.config; s.config = snap.config; }
+    // 地形允许为空数组：回等待房/未开局时 map=[]，必须照样清掉旧障碍方块（不能因 length===0 跳过）。
+    // 否则 backToWaiting 把权威地形重置成空白，客户端却永远留着上局的障碍物。
+    if (snap.map && Array.isArray(snap.map)) {
+      const sig = JSON.stringify(snap.map);
+      if (sig !== this._mapSig) {
+        this._mapSig = sig;
+        s.obstacles = snap.map;
+        this._rebuildObstacles(snap.map);   // 传 [] 时：dispose 旧方块 + 不建新方块 = 清场
+      }
+    }
+  }
+
+  // ---------- 客户端：应用快照 ----------
+  applySnapshot(snap) {
+    // 防御：加入「已销毁/异常」房间时可能收到残缺快照（缺 players/zombies/bullets 数组），
+    // 直接 return 跳过该帧，避免读取 undefined 的 property 报错；下一帧拿到合法快照即恢复正常
+    if (!snap || !Array.isArray(snap.players) || !Array.isArray(snap.zombies) || !Array.isArray(snap.bullets)) {
+      console.warn('[applySnapshot] 丢弃残缺快照（缺少 players/zombies/bullets 数组）');
+      return;
+    }
+    const s = this.state;
+    // 缓冲快照用于插值（保留约 1s 历史）
+    this.clientInterp = true;
+    const nowP = performance.now();
+    // 插值时间轴优先用【服务器发送时刻 snap.st】而非到达时刻：
+    // 到达时刻含 WebSocket/定时器每帧几 ms 的抖动，会直接变成插值速度抖动（卡卡感/偶发冻帧闪跳）。
+    // 用 st + 缓慢校准的时钟偏移（EMA 5%）映射到本地时钟，时间轴与服务器节拍严格同构。
+    let ts = nowP;
+    if (snap.st != null) {
+      if (this._stOff == null) this._stOff = nowP - snap.st;
+      else this._stOff += (nowP - snap.st - this._stOff) * 0.05;
+      ts = this._stOff + snap.st;
+      const last = this.snaps[this.snaps.length - 1];
+      if (last && ts <= last.t) ts = last.t + 0.1;   // 保证单调递增（时钟偏移微调不至倒流）
+    }
+    this.snaps.push({ t: ts, snap });
+    while (this.snaps.length > 2 && this.snaps[0].t < nowP - 1000) this.snaps.shift();
+
+    // 元信息（名字/颜色/存活/击杀/命数）与分数/状态/模式立即采用最新快照
+    s.mode = snap.mode || 'wave';
+    s.livesMax = (snap.livesMax === undefined || snap.livesMax === null) ? 1 : snap.livesMax | 0;   // 0 = 无限命，不能被 ||1 吞掉
+    s.winner = snap.winner || null;
+    s.bounce = !!snap.bounce;
+    s.zmix = snap.zmix || 'progress';
+    s.matchTime = snap.matchTime || 0;
+    s.events = snap.events || [];
+    s.canStart = (snap.canStart === undefined) ? true : !!snap.canStart;   // ready 已随每个玩家下发，无房间级名单
+    if (snap.owner) s.owner = snap.owner;                          // 房主（重连后据此恢复权限标记）
+    // 配置随快照同步：客户端预测的移速/跳跃/半径必须与权威同口径（否则天赋加移速后必发散/橡皮筋）
+    if (snap.config) { this.config = snap.config; s.config = snap.config; }
+    // 地形：仅在内容变化时重建障碍网格（避免每帧重建）
+    if (snap.map) {
+      const sig = JSON.stringify(snap.map);
+      if (sig !== this._mapSig) {
+        this._mapSig = sig;
+        s.obstacles = snap.map;
+        this._rebuildObstacles(snap.map);
+      }
+    }
+    s.players = {};
+    for (const p of snap.players) {
+      // on=0 的离线席位是精简包（无坐标/运动学）：补 0 兜底，防止插值/渲染算出 NaN 位置。
+      // 它仍留在 players 里，供玩家列表与战绩板显示"离线"，只是不上图（syncMeshes 里 visible=false）。
+      s.players[p.id] = {
+        ...p, input: { mx: 0, mz: 0, ax: 0, az: 0, fire: false }, fireCd: 0,
+        on: (p.on === undefined) ? 1 : p.on, out: !!p.out,
+        x: p.x || 0, y: p.y || 0, z: p.z || 0, aim: p.aim || 0,
+        kills: p.kills || 0, lives: p.lives ?? 1, respawnCd: p.respawnCd || 0
+      };
+    }
+    s.zombies = snap.zombies.map((z) => ({ ...z, speed: 0, atkCd: 0 }));
+    s.bullets = snap.bullets.map((b) => ({ ...b, vx: 0, vz: 0, vy: 0, life: 1, owner: null }));
+    s.score = snap.score; s.target = snap.target; s.status = snap.status;
+
+    // ---- 本地预测对账：回滚 + 重放（现代 FPS 同步，替代旧"平滑回拉"）----
+    // 快照回传 ack = 服务器已模拟到的最后指令序号。做法：
+    //   ① 丢弃 seq≤ack 的未确认指令（服务器已算过）
+    //   ② 从快照的完整运动学状态(x,z,y,vy,grounded,jumpBuf,coyoteT)出发
+    //   ③ 用同一个确定性单步函数逐条重放剩余未确认指令
+    // 模拟确定性 ⇒ 重放终点与之前的预测逐位一致 ⇒ 零回拉、零橡皮筋。
+    // 真分歧（被别人挤开/服务器丢指令）时，重放天然落在"服务器版本+我之后的操作"上——这正是权威修正该有的样子。
+    const mp = snap.players.find((q) => q.id === this.myId);
+    if (mp) {
+      if (!mp.alive || (mp.respawnCd || 0) > 0) {
+        this.pred = null; this.predHist.length = 0; this._predStates.length = 0;
+        this._unacked.length = 0;   // 死亡/重生期间交回服务器权威
+      } else if (this.pred && mp.ack != null && mp.ack > 0) {
+        // ① 丢弃已确认指令
+        const ack = mp.ack | 0;
+        while (this._unacked.length && this._unacked[0].seq <= ack) this._unacked.shift();
+        // ② 回滚到快照运动学状态
+        const pr = {
+          x: mp.x, z: mp.z, y: mp.y || 0,
+          vy: mp.vy || 0, grounded: !!mp.gr,
+          jumpBuf: mp.jb || 0, coyoteT: mp.ct || 0, fireCd: mp.fcd || 0,
+        };
+        // ③ 重放剩余未确认指令（每条固定 1/60，与服务器消费口径一致）
+        for (const cmd of this._unacked) this._stepPredCmd(pr, cmd, 1 / 60, mp);
+        this.pred = pr;
+      }
+      // 快照没带 ack（旧版服务器）时不动 pred：预测继续自由跑，交由用户对比 A/B 手感
+    }
+  }
+
+  // 客户端插值：在最近两段快照间按 (now-INTERP) 线性插值，得到连续位置（消除瞬移）
+  interpolate(now) {
+    if (!this.clientInterp || this.snaps.length === 0) return;
+    const INTERP = 50; // 渲染延迟(ms)：须 ≥2 个广播间隔(60Hz→33ms)；仅影响他人/僵尸/子弹，本地玩家走预测零延迟
+    const rt = now - INTERP;
+    const snaps = this.snaps;
+    let a = snaps[0], b = snaps[snaps.length - 1];
+    for (let i = 0; i < snaps.length; i++) {
+      if (snaps[i].t > rt) { b = snaps[i]; a = i > 0 ? snaps[i - 1] : snaps[i]; break; }
+    }
+    const span = (b.t - a.t) || 1;
+    const f = Math.max(0, Math.min(1, (rt - a.t) / span));
+    const A = a.snap, B = b.snap;
+    const lerp = (u, v) => u + (v - u) * f;
+    const lerpAim = (u, v) => { let d = v - u; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return u + d * f; };
+
+    const Am = new Map(A.players.map((p) => [p.id, p]));
+    for (const id in this.state.players) {
+      const Bp = B.players.find((p) => p.id === id), Ap = Am.get(id), t = this.state.players[id];
+      if (t.on === 0) continue;   // 离线席位无坐标，插值会算出 NaN
+      if (Bp && Ap && Bp.on !== 0 && Ap.on !== 0) { t.x = lerp(Ap.x, Bp.x); t.y = lerp(Ap.y || 0, Bp.y || 0); t.z = lerp(Ap.z, Bp.z); t.aim = lerpAim(Ap.aim, Bp.aim); }
+      else if (Bp && Bp.on !== 0) { t.x = Bp.x; t.y = Bp.y || 0; t.z = Bp.z; t.aim = Bp.aim; }
+    }
+    const Az = new Map(A.zombies.map((z) => [z.id, z]));
+    for (const z of this.state.zombies) {
+      const Bz = B.zombies.find((z2) => z2.id === z.id), Azp = Az.get(z.id);
+      if (Bz && Azp) { z.x = lerp(Azp.x, Bz.x); z.z = lerp(Azp.z, Bz.z); }
+      else if (Bz) { z.x = Bz.x; z.z = Bz.z; }
+    }
+    const Ab = new Map(A.bullets.map((b) => [b.id, b]));
+    for (const b of this.state.bullets) {
+      const Bb = B.bullets.find((b2) => b2.id === b.id), Abp = Ab.get(b.id);
+      if (Bb && Abp) { b.x = lerp(Abp.x, Bb.x); b.y = lerp(Abp.y || 0, Bb.y || 0); b.z = lerp(Abp.z, Bb.z); }
+      else if (Bb) { b.x = Bb.x; b.y = Bb.y || 0; b.z = Bb.z; }
+    }
+  }
+
+  // ---------- 渲染同步 ----------
+  _ensure(map, key, factory) {
+    let m = map.get(key);
+    if (!m) { m = factory(); m.userData.first = true; map.set(key, m); this.scene.add(m); }
+    return m;
+  }
+
+  syncMeshes() {
+    const s = this.state;
+    const seenP = new Set();
+    for (const id in s.players) {
+      const p = s.players[id]; seenP.add(id);
+      const m = this._ensure(this.playerMeshes, id, () => this._playerMesh(p.color));
+      m.visible = (p.on !== 0) && p.alive;   // 离线者从图中移除存在（席位保留，但人不在场上）
+      if (p.on === 0) continue;              // 离线无坐标，跳过定位（否则 position 被 0,0,0 拽走）
+      // 受击面积天赋：视觉模型与碰撞箱同步缩放（所见即所判）
+      const psc = (p.scale != null) ? p.scale : (p.stats ? p.stats.scale : 1);
+      if (m.scale.x !== psc) m.scale.setScalar(psc);
+      if (m.userData.first) {
+        m.position.set(p.x, p.y, p.z); m.userData.first = false;
+      } else if (this.clientInterp) {
+        m.position.set(p.x, p.y, p.z); // 客户端已插值，直接定位即平滑
+      } else {
+        m.position.x += (p.x - m.position.x) * 0.35;
+        m.position.z += (p.z - m.position.z) * 0.35;
+        m.position.y = p.y;
+      }
+      m.rotation.y = p.aim;
+    }
+    for (const [id, m] of this.playerMeshes) if (!seenP.has(id)) { this.scene.remove(m); this.playerMeshes.delete(id); }
+
+    const seenZ = new Set();
+    for (const z of s.zombies) {
+      seenZ.add(z.id);
+      const my = z.y || 0;
+      const m = this._ensure(this.zombieMeshes, z.id, () => this._zombieMesh(z.k));
+      if (m.userData.first) { m.position.set(z.x, my, z.z); m.userData.first = false; }
+      else if (this.clientInterp) { m.position.set(z.x, my, z.z); }
+      else { m.position.x += (z.x - m.position.x) * 0.4; m.position.z += (z.z - m.position.z) * 0.4; }
+      m.position.y = my;   // 飞行僵尸 y 连续变化，直接定位（不插值滞后）
+    }
+    for (const [id, m] of this.zombieMeshes) if (!seenZ.has(id)) { this.scene.remove(m); this.zombieMeshes.delete(id); }
+
+    const seenB = new Set();
+    for (const b of s.bullets) {
+      seenB.add(b.id);
+      const m = this._ensure(this.bulletMeshes, b.id, () => this._bulletMesh());
+      m.position.set(b.x, b.y || 1.0, b.z);
+    }
+    for (const [id, m] of this.bulletMeshes) if (!seenB.has(id)) { this.scene.remove(m); this.bulletMeshes.delete(id); }
+  }
+
+  // ---------- 本地预测（指令流版）----------
+  // main.js 每渲染帧喂入当前输入状态；predictTick 按固定步长把它切成带 seq 的指令
+  feedLocalInput(inp) {
+    // 跳跃是「边沿」：controls.getInput() 读一次即清零。本函数每渲染帧被调用，而 predictTick
+    // 只在 1/60 才把输入打包成指令 —— 高帧率下（144Hz≈每 2.4 帧才一步）抓到 jump:true 的那帧
+    // 会被紧接着的 jump:false 覆盖，预测步根本没看见 ⇒ 按跳没反应（帧率越高丢得越多）。
+    // 故在此锁存边沿，由 _predStepOnce 生成指令时才消费：每次按跳必定恰好兑现一条指令。
+    if (inp && inp.jump) this._jumpLatch = true;
+    this.predInput = inp;
+  }
+
+  // 每渲染帧本地模拟自己的移动/跳跃——与 sim-core.step 玩家段逐行同构（同一套 map-core 碰撞）
+  // 固定步长预测：累加真实帧时间，按 1/60 步进，与服务器同口径 → 碰撞解算一致，不再发散。
+  // 每帧最多追 5 步（防卡顿/切后台后的螺旋死亡），多余时间丢弃。
+  predictTick(realDt) {
+    const FIXED = 1 / 60;
+    this._predAcc += realDt;
+    if (this._predAcc > 0.25) this._predAcc = 0.25;  // 防爆炸式追帧
+    let steps = 0;
+    while (this._predAcc >= FIXED && steps < 5) {
+      this._simT += FIXED;
+      this._predStepOnce(FIXED);
+      if (this.pred) this._predStates.push({ t: this._simT, x: this.pred.x, z: this.pred.z, y: this.pred.y });
+      this._predAcc -= FIXED;
+      steps++;
+    }
+    // 修剪状态缓冲（保留约 0.5s，足够渲染延迟插值取包围段）
+    while (this._predStates.length && this._predStates[0].t < this._simT - 0.5) this._predStates.shift();
+    // 本帧生成的指令批量上行（一帧一包，最多 5 条）
+    if (this._pendingCmds.length && this.onCmds) {
+      this.onCmds(this._pendingCmds.splice(0));
+    }
+  }
+
+  // 渲染用插值预测位置：带模拟时间戳的状态缓冲 + 渲染延迟(1 步)插值。
+  // 始终在「渲染时刻 = simT - 1步」两侧的真实状态间线性插值 → 任意帧率/掉帧都不溢出、不抖动。
+  _predRender() {
+    if (!this.pred) return null;
+    const st = this._predStates;
+    if (st.length === 0) return { x: this.pred.x, z: this.pred.z, y: this.pred.y };
+    // 渲染时刻 = 模拟时间 - 1 步 + 累加器余量。余量(_predAcc)每帧随真实时间连续增长，
+    // 加上它后 rt 在两个模拟步之间平滑前进，插值因子 f 在 0→1 连续扫过 → 本地角色位置连续插值。
+    // 旧写法只用 _simT（阶梯状，只在 tick 那一帧跳），导致 f 恒为 0、本地角色一格一格蹦 = 手机"不跟手/顿挫"。
+    const rt = this._simT - (1 / 60) + this._predAcc;
+    if (rt <= st[0].t) return { x: st[0].x, z: st[0].z, y: st[0].y };
+    let a = st[0], b = st[st.length - 1];
+    for (let i = st.length - 1; i >= 0; i--) {
+      if (st[i].t <= rt) { a = st[i]; b = st[i + 1] || st[i]; break; }
+    }
+    const span = (b.t - a.t) || 1;
+    const f = Math.max(0, Math.min(1, (rt - a.t) / span));
+    return {
+      x: a.x + (b.x - a.x) * f,
+      z: a.z + (b.z - a.z) * f,
+      y: a.y + (b.y - a.y) * f,
+    };
+  }
+
+  _predStepOnce(dt) {
+    if (!this.clientInterp || !this.myId) return;
+    const sp = this.state.players[this.myId];
+    if (!sp || !sp.alive) {
+      this.pred = null; this.predHist.length = 0; this._predStates.length = 0;
+      this._unacked.length = 0; this._pendingCmds.length = 0;   // 死亡：清未确认队列（服务器同样丢弃）
+      this._jumpLatch = false;                                   // 死亡期间按的跳不留到复活瞬间兑现
+      return;
+    }
+    if (!this.pred) this.pred = { x: sp.x, z: sp.z, y: sp.y || 0, vy: 0, grounded: true, jumpBuf: 0, coyoteT: 0, fireCd: 0 };
+    // 1) 把当前输入状态切成一条带 seq 的指令（方向用本地瞬时 yaw：转身走位零延迟）
+    const inp = this.predInput || { mx: 0, mz: 0 };
+    const yaw = (this.myYaw != null) ? this.myYaw : sp.aim;
+    const cmd = {
+      seq: ++this._cmdSeq,
+      mx: inp.mx || 0, mz: inp.mz || 0,
+      ax: Math.sin(yaw), az: Math.cos(yaw),
+      pitch: (this.myPitch != null) ? this.myPitch : (inp.pitch || 0),
+      fire: !!inp.fire, jump: this._jumpLatch,
+    };
+    this._jumpLatch = false;   // 边沿只兑现一条指令（不重复武装 → 不会一次按跳连跳两下）
+    // 2) 本地立即模拟这条指令（零延迟跟手）
+    this._stepPredCmd(this.pred, cmd, dt, sp);
+    // 3) 存入未确认队列 + 待上行批
+    this._unacked.push(cmd);
+    if (this._unacked.length > 180) this._unacked.shift();   // 3s 兜底（正常 ack 会及时清）
+    this._pendingCmds.push(cmd);
+  }
+
+  // 确定性单步：用一条指令推进一份预测状态（预测与回滚重放共用同一函数 → 逐位一致）。
+  // 与 sim-core._stepPlayerOnce 玩家段逐行同构（同一套 map-core 碰撞 / gameConfig 数值）。
+  _stepPredCmd(pr, cmd, dt, sp) {
+    if (cmd.jump) pr.jumpBuf = JUMP_BUFFER;   // 与服务器 queueCmds→step 的武装时机一致
+    let mx = cmd.mx || 0, mz = cmd.mz || 0;
+    const ml = Math.hypot(mx, mz);
+    if (ml > 1) { mx /= ml; mz /= ml; }
+    // 方向取指令里的 ax/az（重放时用"当时"的朝向，而非现在的相机）——与服务器同口径
+    const sa = cmd.ax, ca = cmd.az;
+    const fwd = -mz, strafe = mx;
+    const dx = fwd * sa - strafe * ca;
+    const dz = fwd * ca + strafe * sa;
+    const obs = this.state.obstacles || [];
+    // 移速/半径/跳跃力全部与权威同口径（config 随快照同步；天赋加成用快照里自己的 talent 派生）——
+    // 任何一项不一致都会导致预测发散 → 重放偏差，绝不许硬编码
+    const myStats = computeStats(this.config, sp.talent);
+    const spd = myStats.moveSpeed;
+    const myR = PLAYER_OBS_R * (sp.scale || myStats.scale || 1);
+    const nx = clamp(pr.x + dx * spd * dt, -MAP + 1, MAP - 1);
+    const nz = clamp(pr.z + dz * spd * dt, -MAP + 1, MAP - 1);
+    const mv = moveCircle(obs, pr.x, pr.z, nx, nz, myR, pr.y);
+    pr.x = mv.x; pr.z = mv.z;
+    const sup = topAt(obs, pr.x, pr.z, SUPPORT_R);
+    // 跳跃缓冲 + 土狼时间（与服务器 step 完全同口径 → 起跳时机一致，不发散）
+    if (pr.grounded) pr.coyoteT = COYOTE;
+    else if (pr.coyoteT > 0) pr.coyoteT -= dt;
+    if (pr.jumpBuf > 0 && (pr.grounded || pr.coyoteT > 0)) {
+      pr.vy = this.config.COMBAT.jumpForce; pr.grounded = false; pr.jumpBuf = 0; pr.coyoteT = 0;
+    } else if (pr.jumpBuf > 0) {
+      pr.jumpBuf -= dt;
+    }
+    if (pr.grounded && pr.y > sup + 0.01) pr.grounded = false;
+    if (!pr.grounded) {
+      pr.vy -= GRAVITY * dt;
+      pr.y += pr.vy * dt;
+      if (pr.y <= sup && pr.vy <= 0) { pr.y = sup; pr.vy = 0; pr.grounded = true; }
+    } else {
+      pr.y = sup;
+    }
+    // 落地/移动兜底去穿透（与权威模拟一致）：客户端预测落进窄缝也顶出，不卡在本地
+    depenetratePlayer(obs, pr, myR);
+  }
+
+  updateCamera() {
+    const p = this.state.players[this.myId];
+    // 本地预测优先：用固定步长模拟 + 渲染插值的平滑位置（零延迟跟手且任意帧率顺滑）
+    const pr = this._predRender();
+    const tx = pr ? pr.x : (p ? p.x : 0), tz = pr ? pr.z : (p ? p.z : 0);
+    // 相机朝向用【本地瞬时】yaw/pitch（Controls 每帧喂入），不用服务器回传插值的 p.aim——
+    // 否则转镜头时相机滞后一个网络往返，准星与实际弹道方向对不上（“子弹不从准星出”的真凶）
+    const aim = (this.myYaw != null) ? this.myYaw : (p ? p.aim : 0);
+    const selfY = pr ? pr.y : (p ? p.y : 0);
+    const eye = 1.6 + selfY;
+    // 第一人称：相机贴在角色眼睛高度（含跳跃高度），沿瞄准方向看（含上下俯仰 pitch）
+    if (this.clientInterp) this.camera.position.set(tx, eye, tz); // 客户端已插值，直接定位
+    else this.camera.position.lerp(new THREE.Vector3(tx, eye, tz), 0.25);
+    const pitch = this.myPitch || 0;
+    const dirX = Math.sin(aim) * Math.cos(pitch);
+    const dirY = Math.sin(pitch);
+    const dirZ = Math.cos(aim) * Math.cos(pitch);
+    this.camera.lookAt(
+      this.camera.position.x + dirX * 12,
+      eye + dirY * 12,
+      this.camera.position.z + dirZ * 12
+    );
+    // 隐藏本地角色（避免第一人称看到自己身体穿插）
+    const me = this.playerMeshes.get(this.myId);
+    if (me) me.visible = false;
+  }
+
+  render() {
+    const now = performance.now();
+    let dt = (now - (this._lastRT || now)) / 1000;
+    this._lastRT = now;
+    if (dt > 0.25) dt = 0.25;   // 防切后台/卡顿后的大 dt 引发跳变
+    if (this.clientInterp) { this.predictTick(dt); this.interpolate(now); }
+    this.syncMeshes();
+    this.updateCamera();
+    this.renderer.render(this.scene, this.camera);
+    // U4 游戏模式要求每帧绘制完显式提交，否则画面不上屏（仅 gameMode 真开成功时才调）
+    if (this._gameMode && this._gl && this._gl.submit) {
+      try { this._gl.submit(); } catch (e) {}
+    }
+  }
+
+  _clearMeshes() {
+    for (const m of this.playerMeshes.values()) this.scene.remove(m);
+    for (const m of this.zombieMeshes.values()) this.scene.remove(m);
+    for (const m of this.bulletMeshes.values()) this.scene.remove(m);
+    this.playerMeshes.clear(); this.zombieMeshes.clear(); this.bulletMeshes.clear();
+  }
+}

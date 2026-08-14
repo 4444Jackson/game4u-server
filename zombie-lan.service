@@ -1,0 +1,29 @@
+# systemd 单元 —— 生产直跑 Node（不用 Docker 时）
+# 用法：
+#   把整个 zombie-lan-server 目录放到 /opt/zombie-lan
+#   sudo cp zombie-lan.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now zombie-lan
+#   看日志：sudo journalctl -u zombie-lan -f
+
+[Unit]
+Description=Game4U 多人联机
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/zombie-lan
+ExecStart=/usr/bin/node /opt/zombie-lan/relay.cjs
+Environment=PORT=8123
+Environment=TICK_HZ=30
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=2
+# 内存保护：1GiB 小机把上限卡在 768M，异常时也不拖垮整机
+MemoryMax=768M
+# 用部署用的普通用户（不要用 root）。如没有 www-data 改成你的用户名
+User=www-data
+Group=www-data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+{
+  "name": "game4u",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Game4U · 多人联机（Three.js + Node 权威服务器）",
+  "scripts": {
+    "build": "vite build",
+    "start": "node relay.cjs",
+    "smoke": "node test-smoke.cjs"
+  },
+  "//note": "运行时服务器(relay.cjs)仅依赖 Node 内置模块，无需 npm install；下方 three/vite 仅用于本地重新构建前端 dist。",
+  "dependencies": {
+    "three": "^0.160.1"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
