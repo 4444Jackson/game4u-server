@@ -233,8 +233,8 @@ export class Sim {
       p.hp = p.maxHp;
       // 命数 = 基础 + 天赋命数加成；基础 0 = 无限命（天赋加成无意义，保持 0 标记无限）
       p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
+      p._extraLives = st.extraLives;   // 记录已应用的额外命数，复活时只补增量
       p.out = false;            // 新一局：所有人清空出局标记
-      p._lateJoin = false;      // 新一局：清空上一局晚加入标记（避免重开时误触发复活重算）
       p.ready = 0;              // 新一局：标志位全清（下次回等待房/阵亡时重新弹面板要求重配）
       p.respawnCd = 0;
       p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
@@ -662,13 +662,17 @@ export class Sim {
           const st = computeStats(this.config, p.talent);
           p.stats = st;
           p.radius = PLAYER_OBS_R * st.scale;
-          // 游戏进行中晚加入者：首次复活才按当前天赋补足命数上限（含天赋命数加成），
-          // 使与开局玩家一致——否则晚加入者命数缺天赋命数加成，等于天赋命数白点。
-          // 之后正常复活只保留剩余命数（不回满），与开局玩家行为一致。
-          if (p._lateJoin) {
-            p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
-            p._lateJoin = false;
+          // 命数随天赋「命数」等级增量同步：只补 delta(本次−上次应用)，不重复加也不漏加；
+          // 晚加入者首复活时 _extraLives 未设(=0)，delta=当前天赋命数→自动补足，与开局玩家一致。
+          // 无限命(livesMax===0)恒为 0 标记。
+          const cap = (s.livesMax || 0) + st.extraLives;
+          if (s.livesMax === 0) {
+            p.lives = 0;
+          } else {
+            const delta = st.extraLives - (p._extraLives || 0);
+            p.lives = Math.min(p.lives + Math.max(0, delta), cap);
           }
+          p._extraLives = st.extraLives;
           p.hp = p.maxHp; p.alive = true;
           p.y = 0; p.vy = 0; p.grounded = true;
           p.jumpBuf = 0; p.coyoteT = 0;
