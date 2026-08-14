@@ -191,6 +191,8 @@ html, body {
   z-index: 14; pointer-events: none;
 }
 .host-info b { color: var(--primary); }
+/* 打开操作设置时隐藏"游戏地址"提示，避免它压住设置面板（设置面板 z-index 高于 HUD 整层，但地址提示长文会视觉重叠） */
+.settings-open .host-info { display: none !important; }
 
 /* 通用横向排列行：名字输入框行 / 按钮行等 */
 .row { display: flex; gap: 8px; margin-top: 10px; }

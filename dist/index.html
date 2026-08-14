@@ -69,6 +69,15 @@
           <button id="zmix-mix" class="seg-btn" type="button">混出</button>
         </div>
       </div>
+      <div id="respawn-row" class="lives-row">
+        <span class="lives-text">复活时间</span>
+        <div class="lives-stepper">
+          <button id="respawn-less" class="step-btn">−</button>
+          <span id="respawn-label" class="lives-num">2.5</span>
+          <button id="respawn-more" class="step-btn">＋</button>
+        </div>
+        <small class="opt-sub">（秒 · 死亡后重生倒计时）</small>
+      </div>
       <!-- 对战模式：房主高级配置（可折叠；全部有默认值，不改也能开局） -->
       <details id="adv-config" class="adv-config hidden">
         <summary>⚙ 高级配置（对战规则 · 可选）</summary>
@@ -85,6 +94,7 @@
           <label>房间人数上限<input id="cfg-maxPlayers" type="number" min="2" max="16" value="8" /></label>
         </div>
         <small class="opt-sub">留空/不动 = 默认值。命数在上方「每人命条数」设置。</small>
+        <button id="adv-reset" class="big-btn ghost">恢复默认</button>
       </details>
       <button id="btn-mode-start" class="big-btn primary">创建房间</button>
       <button id="btn-mode-back" class="big-btn ghost">返回</button>

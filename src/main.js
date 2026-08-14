@@ -58,6 +58,7 @@ const hide = (id) => el(id).classList.add('hidden');
 function closeOverlays() {
   hide('settings-panel');
   hide('layout-hint');
+  document.body.classList.remove('settings-open');   // 收掉设置面板时同步撤掉"隐藏地址提示"标记
 }
 
 // ============ 「主机」与「房主」是两回事，切勿混用 ============
@@ -99,6 +100,7 @@ let gameLives = 1;      // 命条数（房主设定；wave 默认 1、versus 默
 let gameTarget = 100;   // 僵尸浪潮击杀目标（房主设定；0 = 无限/无尽生存）
 let gameBounce = false; // 房主设定：子弹撞墙/障碍是否反弹
 let gameZmix = 'progress'; // 僵尸出现方式：'progress' 随进度逐步引入 | 'mix' 全程混出
+let gameRespawn = 2.5;  // 复活时间(秒)：房主可自定义；0.5~10，默认 2.5
 const DEFAULT_LIVES = 3;  // 对战模式默认命条数
 
 // ---- 对战：房主高级配置（13 项变量 → gameConfig 覆盖对象；仅 versus 模式读取/下发） ----
@@ -123,6 +125,7 @@ function readAdvConfig() {
       playerScale: num('cfg-playerScale', 1),
       maxPlayers: num('cfg-maxPlayers', 8) | 0,
       baseLives: gameLives,   // 与上方「每人命条数」选择联动（单一来源）
+      respawnTime: gameRespawn,   // 房主自定义复活时间（两模式通用；单一来源 gameRespawn）
     },
   };
 }
@@ -132,7 +135,7 @@ const versusConfig = () => (gameMode === 'versus' ? readAdvConfig() : null);
 // 一律留空 → relay 侧回退到 room.meta（建房时原房主选的），避免"换个房主房间玩法就变了"。
 const startGameMsg = () => (isPromotedOwner
   ? { type: 'startGame' }
-  : { type: 'startGame', mode: gameMode, lives: gameLives, target: gameMode === 'wave' ? gameTarget : 0, bounce: gameBounce, zmix: gameZmix, config: versusConfig() });
+  : { type: 'startGame', mode: gameMode, lives: gameLives, target: gameMode === 'wave' ? gameTarget : 0, bounce: gameBounce, zmix: gameZmix, respawnTime: gameRespawn, config: versusConfig() });
 
 // ---- 对战：本地天赋加点状态（开局前可改；变更即上行，服务器端校验） ----
 const talent = { atk: 0, def: 0, spd: 0, size: 0, lives: 0 };
@@ -347,7 +350,8 @@ async function startHost(gm, lv, opts) {
 
 // 打开「选择游戏类型」面板（建房前）
 function openModeSelect() {
-  gameMode = 'wave'; gameLives = 1; gameTarget = 100; gameBounce = false; gameZmix = 'progress';
+  gameMode = 'wave'; gameLives = 1; gameTarget = 100; gameBounce = false; gameZmix = 'progress'; gameRespawn = 2.5;
+  const rl = el('respawn-label'); if (rl) rl.textContent = '2.5';
   const ms = el('mode-select');
   if (!ms) { startHost('wave', 1, { bounce: false, zmix: 'progress', target: 100 }); return; }
   // 重置 UI 状态
@@ -684,6 +688,14 @@ function initApp() {
   const tLess = el('target-less'), tMore = el('target-more');
   if (tLess) tLess.onclick = () => { gameTarget = Math.max(0, gameTarget - 10); updateTargetLabel(); };
   if (tMore) tMore.onclick = () => { gameTarget = Math.min(500, gameTarget + 10); updateTargetLabel(); };
+  const rLess = el('respawn-less'), rMore = el('respawn-more');
+  const updateRespawnLabel = () => { const e = el('respawn-label'); if (e) e.textContent = gameRespawn.toFixed(1); };
+  if (rLess) rLess.onclick = () => { gameRespawn = Math.max(0.5, +(gameRespawn - 0.5).toFixed(1)); updateRespawnLabel(); };
+  if (rMore) rMore.onclick = () => { gameRespawn = Math.min(10, +(gameRespawn + 0.5).toFixed(1)); updateRespawnLabel(); };
+  const advReset = el('adv-reset');
+  if (advReset) advReset.onclick = () => {
+    document.querySelectorAll('#adv-config input[type=number]').forEach((i) => { if (i.hasAttribute('value')) i.value = i.getAttribute('value'); });
+  };
   const bModeStart = el('btn-mode-start');
   if (bModeStart) bModeStart.onclick = () => startHost(gameMode, gameLives, { bounce: gameBounce, zmix: gameZmix, target: gameMode === 'wave' ? gameTarget : 0 });
   const bModeBack = el('btn-mode-back');
@@ -785,13 +797,13 @@ function initApp() {
     if (CTRL_MODE === 'touch') { pc && pc.classList.add('hidden'); touch && touch.classList.remove('hidden'); }
     else { pc && pc.classList.remove('hidden'); touch && touch.classList.add('hidden'); }
   };
-  el('btn-settings').onclick = () => { sPanel.classList.toggle('hidden'); applySettingsVisibility(); };
+  el('btn-settings').onclick = () => { sPanel.classList.toggle('hidden'); applySettingsVisibility(); document.body.classList.toggle('settings-open', !sPanel.classList.contains('hidden')); };
   // 局内设置→回到大厅：避免「困死」（如结算后无路可退）。等价于主动离开房间，席位保留可重连。
   const leaveLobbyBtn = el('btn-leave-lobby');
   if (leaveLobbyBtn) leaveLobbyBtn.onclick = () => goLobby();
   // 结算层「回主菜单」也走同一路径（置 _leftIntent，不会因自动重连又弹回房间）
   el('btn-result-menu').onclick = () => goLobby();
-  el('set-close').onclick = () => sPanel.classList.add('hidden');
+  el('set-close').onclick = () => { sPanel.classList.add('hidden'); document.body.classList.remove('settings-open'); };
 
   // ---- 触摸：转视角/摇杆灵敏度 + 拖动布置 ----
   const setLook = el('set-look'), setJoy = el('set-joy');

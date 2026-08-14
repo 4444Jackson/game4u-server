@@ -38,6 +38,7 @@ export const GAME_CONFIG = {
     mapSize: 50,          // 地图边长（米，正方形）。【已拍板 2026-07-30：固定值不开放房主调整】与 map-core.js 的 MAP 常量必须一致，动它需专项回归（碰撞/出生点/寻路/预测），不要接入配置面板
     baseLives: 3,         // 初始命数（死亡后复活次数；0 = 无限命——配合 timeLimit=0 即「敞开无限玩」）
     playerScale: 1.0,     // 玩家模型大小缩放系数
+    respawnTime: 2.5,    // 死亡后重生倒计时(秒)；房主建房时可自定义（见 main.js gameRespawn）
   },
 };
 

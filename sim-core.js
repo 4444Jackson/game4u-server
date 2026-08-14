@@ -22,7 +22,7 @@ const ZOMBIE_DMG = 9;
 const DEFAULT_WAVE_TARGET = 100;  // 僵尸浪潮默认击杀目标（房主可改；0 = 无限/无尽生存）
 const MAX_ZOMBIES = 22;
 const SPAWN_INTERVAL = 1.1;
-export const RESPAWN_TIME = 2.5;    // 死亡后重生倒计时(秒)；relay.cjs 也引用此单一真源，勿在两侧各写一份
+const DEFAULT_RESPAWN = 2.5;  // 死亡后重生倒计时(秒)默认值；可被 config.ROOM.respawnTime 覆盖（房主建房时可自定义）
 const GRAVITY = 24;
 const JUMP_BUFFER = 0.15;    // 跳跃缓冲：按下后记住 0.15s，落地/coyote 窗口内才起跳（落地前一点点按跳不丢）
 const COYOTE = 0.10;         // 土狼时间：离地后 0.10s 内仍可起跳（走下箱顶边缘不卡）
@@ -299,10 +299,10 @@ export class Sim {
     p.ready = 0;   // 阵亡即作废"配好了"：复活窗口内面板自动弹出，可「重装上阵」改配装
     if (this.state.livesMax === 0) {
       p.lives = 0;
-      p.respawnCd = RESPAWN_TIME;     // 无限命：死亡后重生，不扣命，永不 out
+      p.respawnCd = (this.config.ROOM.respawnTime) || DEFAULT_RESPAWN;     // 无限命：死亡后重生，不扣命，永不 out
     } else {
       p.lives -= 1;
-      if (p.lives > 0) p.respawnCd = RESPAWN_TIME;
+      if (p.lives > 0) p.respawnCd = (this.config.ROOM.respawnTime) || DEFAULT_RESPAWN;
       else { p.lives = 0; p.out = true; p.respawnCd = 0; }
     }
   }
@@ -410,8 +410,9 @@ export class Sim {
       // 体积/移动碰撞：圆柱（半径=PLAYER_OBS_R×受击面积缩放，旋转无关、贴墙顺滑）；伤害判定另用 obbOverlap 严格方块
       const mv = moveCircle(obs, p.x, p.z, nx, nz, p.radius, p.y);
       p.x = mv.x; p.z = mv.z;
-      // 垂直：支撑面 = 脚下障碍物顶面(或地面 0)；跳跃/走出边缘自然下落
-      const sup = topAt(obs, p.x, p.z, SUPPORT_R);
+      // 垂直：支撑面 = 脚下障碍物顶面(或地面 0)；跳跃/走出边缘自然下落。
+      // 支撑判定半径随玩家碰撞半径缩放（恒 < 半径），否则缩小体型者贴墙会被误判"站在顶面"瞬移上顶。
+      const sup = topAt(obs, p.x, p.z, Math.min(SUPPORT_R, p.radius * 0.5));
       // 跳跃缓冲 + 土狼时间：grounded 时刷新 coyote；离地后 coyote 倒计时；缓冲在落地/coyote 窗口内才起跳
       if (p.grounded) p.coyoteT = COYOTE;
       else if (p.coyoteT > 0) p.coyoteT -= dt;

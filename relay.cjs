@@ -89,7 +89,7 @@ function parseFrame(data) {
 //         注意：线上协议字段仍叫 nudgeHost / hostChanged / hostId，其中的 "host" 均指【房主】，
 //         为兼容已发布的客户端未改名，读代码时勿与本进程这个真正的主机混淆。
 (async () => {
-  const { Sim, RESPAWN_TIME } = await import('./sim-core.js');
+  const { Sim } = await import('./sim-core.js');
   const rooms = new Map();      // roomId -> { id, sim, players:Map<conn,cid>, meta, ownerCid（房主，非主机）}
   let nextCid = 1;
   let nextRid = 1;
@@ -260,8 +260,8 @@ function parseFrame(data) {
       if (room.sim.state.status === 'playing') {
         const sp = room.sim.state.players[cid];
         sp.alive = false;
-        sp.respawnCd = RESPAWN_TIME;
         sp.lives = room.sim.state.livesMax;   // 0 = 无限命
+        sp.respawnCd = (room.sim.config.ROOM.respawnTime) || 2.5;
         sp.out = false;
       }
       relaySend(conn, { type: 'welcome', id: cid, roomId: msg.roomId, owner: room.ownerCid });
@@ -338,6 +338,12 @@ function parseFrame(data) {
         });
         console.log('[relay] 房间', room.id, '对战开局被拒：在线', r.length, '人，未 ready=', waiting.join('|'));
         return;
+      }
+      // 复活时间：房主可自定义（top-level 字段，两模式通用）；未传则沿用 meta 兜底（接任房主沿用原房设置）
+      const rt = (msg.respawnTime !== undefined && msg.respawnTime !== null) ? msg.respawnTime : room.meta.respawnTime;
+      if (rt !== undefined && rt !== null) {
+        room.meta.respawnTime = rt;
+        try { room.sim.setConfig({ ROOM: { respawnTime: rt } }); } catch (_) {}
       }
       room.sim.startGame(md, lv, { bounce: bo, zmix: zm, target: t, config: cfg });   // 内部会清空全员 ready 标志位
       broadcastStatic(room);   // 开局重随机地形 → 全房重建网格（这之后每帧快照不再含 map）
