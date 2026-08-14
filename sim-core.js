@@ -9,7 +9,7 @@ import {
   MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,
   bulletWorld, pickZombieKind, ZSTAT, stepZombie
 } from './map-core.js';
-import { makeConfig, computeStats, computeDamage, talentTotalCost } from './gameConfig.js';
+import { makeConfig, computeStats, talentTotalCost } from './gameConfig.js';
 
 const PLAYER_OBS_R = 0.6;    // 玩家碰撞方块半边长基准（= 可视方块底面 1.2 / 2；OBB 随瞄准转）。实战半径 = 此值 × 受击面积缩放
 const SUPPORT_R = 0.25;      // 站立支撑判定半径（必须 < 玩家半径，防止贴墙瞬移上顶）
@@ -22,13 +22,14 @@ const ZOMBIE_DMG = 9;
 const DEFAULT_WAVE_TARGET = 100;  // 僵尸浪潮默认击杀目标（房主可改；0 = 无限/无尽生存）
 const MAX_ZOMBIES = 22;
 const SPAWN_INTERVAL = 1.1;
-const RESPAWN_TIME = 2.5;    // 死亡后重生倒计时(秒)
+export const RESPAWN_TIME = 2.5;    // 死亡后重生倒计时(秒)；relay.cjs 也引用此单一真源，勿在两侧各写一份
 const GRAVITY = 24;
 const JUMP_BUFFER = 0.15;    // 跳跃缓冲：按下后记住 0.15s，落地/coyote 窗口内才起跳（落地前一点点按跳不丢）
 const COYOTE = 0.10;         // 土狼时间：离地后 0.10s 内仍可起跳（走下箱顶边缘不卡）
 const VISUAL_H = 1.8;        // 玩家可视方块高度（用于子弹命中高度判定；随缩放同步）
 
 const PALETTE = [0x4f9bff, 0xff9f43, 0x2ecc71, 0xff5e7e, 0xb56bff, 0x46d6d6];
+const EMPTY_EVENTS = [];   // 击杀日志为空时的共享占位（快照只读不写，安全复用）
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -139,12 +140,6 @@ export class Sim {
     p.aim = 0;
   }
 
-  // 真删玩家对象。仅用于销毁/清空房间——正常掉线走 setOffline，
-  // 否则对战的"总人数"分母会塌陷（历史 bug：removePlayer 真删 → 剩 1 人立刻误判结束）。
-  purgePlayer(id) {
-    delete this.state.players[id];
-  }
-
   // 玩家分配天赋（开局前）。校验不超过点数；越界忽略。
   setTalent(id, talent) {
     const p = this.state.players[id];
@@ -197,11 +192,6 @@ export class Sim {
       });
     }
     p.useCmdStream = true;   // 收到过指令流 → 该玩家切换为指令驱动（不再吃状态式 input）
-  }
-
-  // 彻底清场：把整个房间重置为全新的等待态（用于「最后一人离开」后释放房间）
-  reset() {
-    this.state = this._emptyState();
   }
 
   // 房主点击「开始游戏」——opts = { lives, bounce, zmix, target, config }
@@ -597,7 +587,7 @@ export class Sim {
       mode: s.mode, livesMax: s.livesMax, winner: s.winner || null,
       bounce: s.bounce,
       matchTime: s.matchTime,
-      events: s.events.slice(),    // 击杀滚动日志
+      events: s.events.length ? s.events.slice() : EMPTY_EVENTS,    // 击杀滚动日志（空时复用同一空数组，省每帧切片）
       // 离线玩家只发精简包（on:0）——他不在图上，位置/运动学/天赋一概不发，
       // 客户端据此隐藏其模型；名字/命数/杀数保留，战绩板与玩家列表仍能显示"离线"席位。
       // 这同时是唯一的真性能点：否则离线席位每秒白占十几 KB，手机端 JSON.parse 直接卡。

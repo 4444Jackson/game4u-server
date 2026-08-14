@@ -39,8 +39,6 @@ const MIME = {
   '.wasm': 'application/wasm',
 };
 
-const RESPAWN_TIME = 2.5;   // 须与 sim-core.js 保持一致：死亡后重生倒计时(秒)
-
 // 【二值在场模型】玩家只有两种连接态，不做第三种，也不做任何超时探活：
 //   state=1 在线（默认初值）
 //   state=0 离线 —— WS 断开 与 主动"回到大厅" 合并为同一状态，不区分原因、不设超时、随时可回。
@@ -91,7 +89,7 @@ function parseFrame(data) {
 //         注意：线上协议字段仍叫 nudgeHost / hostChanged / hostId，其中的 "host" 均指【房主】，
 //         为兼容已发布的客户端未改名，读代码时勿与本进程这个真正的主机混淆。
 (async () => {
-  const { Sim } = await import('./sim-core.js');
+  const { Sim, RESPAWN_TIME } = await import('./sim-core.js');
   const rooms = new Map();      // roomId -> { id, sim, players:Map<conn,cid>, meta, ownerCid（房主，非主机）}
   let nextCid = 1;
   let nextRid = 1;
@@ -100,6 +98,12 @@ function parseFrame(data) {
 
   function relaySend(conn, obj) {
     if (conn && conn.readyState === 1) sendFrame(conn.socket, JSON.stringify(obj));
+  }
+
+  // 热路径专用：同一份已序列化的快照 Buffer 直接发给房里所有连接，避免逐连接重复 JSON.stringify。
+  // 单房 N 人时，每 tick 的序列化成本从 N 次降到 1 次（JSON 序列化正是本服最大 CPU 开销）。
+  function relaySendRaw(conn, buf) {
+    if (conn && conn.readyState === 1) sendFrame(conn.socket, buf);
   }
 
   // 一次性下发静态数据（地形 + 房主配置）：地形只在 startGame 重随机、永不逐帧变，
@@ -502,13 +506,15 @@ function parseFrame(data) {
       try { room.sim.step(TICK_DT); } catch (e) { console.error('[relay] step error', room.id, e); continue; }
       let snap;
       try { snap = room.sim.snapshot(); } catch (e) { continue; }
-      snap.st = Date.now();   // 服务器发送时刻：客户端以此为插值时间轴，滤掉到达抖动
+      const now = Date.now();
+      snap.st = now;   // 服务器发送时刻：客户端以此为插值时间轴，滤掉到达抖动
       // 房间级状态随快照下发（几十字节）：客户端据此渲染 ready 名单、置灰"开始"按钮、标记房主
       snap.owner = room.ownerCid;
       snap.canStart = (snap.mode === 'versus') ? versusCanStart(room) : true;   // ready 名单已随每个玩家下发，不再另发
+      // 单房只序列化一次，整段快照 Buffer 复用给所有连接
+      const buf = Buffer.from(JSON.stringify(snap), 'utf8');
       for (const [c] of room.players) {
-        relaySend(c, snap);
-        const now = Date.now();
+        relaySendRaw(c, buf);
         c._lastSnapT = now;
       }
     }

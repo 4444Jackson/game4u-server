@@ -87,9 +87,3 @@ export function computeStats(cfg, talent) {
     extraLives: lives * T.livesPerLevel,                    // 额外命数 = 命数等级
   };
 }
-
-// 最终伤害公式（需求文档）：max(基础伤害 + 攻击加成 - 对手防御加成, 1)
-//   attackerStats.damage 已含攻击加成；victimStats.defense 已含防御减免。
-export function computeDamage(attackerStats, victimStats) {
-  return Math.max(attackerStats.damage - victimStats.defense, 1);
-}
