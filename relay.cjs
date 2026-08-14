@@ -6,12 +6,8 @@
 //
 // 玩家连入流程：listRooms 看房间列表 → createRoom 建房（建房者即房主）→ joinRoom 选房加入。
 //
-// 与本地旧版（房主浏览器即主机 + WebRTC P2P）的区别：
-//   1) 去掉 WebRTC / werift 中继层 —— 中心化服务器下数据通道也是「浏览器↔服务器」，省不了服务器负载，
-//      反而每个连接要在 Node 内起一个 PeerConnection、很吃内存；改为纯 WebSocket 后运行时零 npm 依赖。
-//   2) 页面 WS 地址 wss:// 自适应：页面走 https 时自动用 wss://，否则 ws://
-//      （日后套 nginx + Let's Encrypt 上 HTTPS，客户端无需改代码即自动切 wss）。
-//   3) 模拟/广播帧率由环境变量 TICK_HZ 控制（默认 60Hz，与原版僵尸联机一致）；dt 同步缩放，物理保持实时。
+// 页面 WS 地址 wss:// 自适应：页面走 https 时自动用 wss://，否则 ws://（日后套 nginx + Let's Encrypt 上 HTTPS 无需改客户端代码）。
+// 模拟/广播帧率由环境变量 TICK_HZ 控制（默认 60Hz）；dt 同步缩放，物理保持实时。
 //
 // 运行： node relay.cjs
 //   环境变量：PORT=8123（监听端口）   TICK_HZ=60（模拟+广播帧率，1~60，默认 60）
