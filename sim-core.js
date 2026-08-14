@@ -444,55 +444,71 @@ export class Sim {
     const s = this.state;
     const obs = s.obstacles;
 
-    // 子弹
+    // 子弹（连续碰撞 CCD）：每 tick 位移切成 ≤0.3m 子步逐段检测，消除近距死区与高速隧穿；
+    // 生成点(p0)单独检一次，覆盖枪口前那一段（原端点检测跳过的起点）
     for (let i = s.bullets.length - 1; i >= 0; i--) {
       const b = s.bullets[i];
-      const px = b.x, pz = b.z;
-      b.x += b.vx * dt; b.z += b.vz * dt; b.y += (b.vy || 0) * dt; b.life -= dt;
       const byaw = Math.atan2(b.vx, b.vz);   // 子弹朝向（沿飞行方向）
+      const travel = Math.hypot(b.vx, b.vz, b.vy || 0) * dt;
+      const STEPS = Math.max(1, Math.ceil(travel / 0.3));
+      const sdt = dt / STEPS;
       let hit = false;
-      if (s.mode === 'versus' && s.status === 'playing') {
-        // 对战：子弹命中其他存活玩家（OBB 精确接触 + 高度够得着）
-        for (const id in s.players) {
-          const p = s.players[id];
-          if (!p.alive || p.id === b.owner) continue;
-          if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, p.x, p.z, p.radius, p.radius, p.aim) &&
-              b.y > p.y - 0.2 && b.y < p.y + VISUAL_H * (p.stats ? p.stats.scale : 1) + 0.5) {
-            const dmg = Math.max((b.dmg || this.config.COMBAT.baseDamage) - (p.stats ? p.stats.defense : 0), 1);
-            p.hp -= dmg; hit = true;
-            if (p.hp <= 0) {
-              p.hp = 0;
-              if (b.owner && s.players[b.owner]) {
-                s.players[b.owner].kills += 1;
-                s.events.push({ id: s.nextEventId++, killer: b.owner, victim: p.id, t: s.matchTime });
-                if (s.events.length > 12) s.events.shift();
+
+      // 命中其他实体（玩家/僵尸）：沿当前子弹位置做 OBB 接触判定，返回是否命中并结算伤害
+      const testTargets = () => {
+        if (s.mode === 'versus' && s.status === 'playing') {
+          // 对战：子弹命中其他存活玩家（OBB 精确接触 + 高度够得着）
+          for (const id in s.players) {
+            const p = s.players[id];
+            if (!p.alive || p.id === b.owner) continue;
+            if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, p.x, p.z, p.radius, p.radius, p.aim) &&
+                b.y > p.y - 0.2 && b.y < p.y + VISUAL_H * (p.stats ? p.stats.scale : 1) + 0.5) {
+              const dmg = Math.max((b.dmg || this.config.COMBAT.baseDamage) - (p.stats ? p.stats.defense : 0), 1);
+              p.hp -= dmg;
+              if (p.hp <= 0) {
+                p.hp = 0;
+                if (b.owner && s.players[b.owner]) {
+                  s.players[b.owner].kills += 1;
+                  s.events.push({ id: s.nextEventId++, killer: b.owner, victim: p.id, t: s.matchTime });
+                  if (s.events.length > 12) s.events.shift();
+                }
+                this._killPlayer(p);
               }
-              this._killPlayer(p);
+              return true;
             }
-            break;
+          }
+        } else {
+          // 僵尸浪潮：子弹命中僵尸（OBB 精确接触 + 飞行僵尸按其飞行高度判定）
+          for (const z of s.zombies) {
+            const zy = z.y || 0;
+            if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, z.x, z.z, ZOMBIE_RADIUS, ZOMBIE_RADIUS, 0) &&
+                b.y > zy - 0.3 && b.y < zy + 2.0) {
+              z.hp -= 1;
+              if (z.hp <= 0) {
+                z.dead = true; s.score += 1;
+                if (b.owner && s.players[b.owner]) s.players[b.owner].kills += 1;
+              }
+              return true;
+            }
           }
         }
-      } else {
-        // 僵尸浪潮：子弹命中僵尸（OBB 精确接触 + 飞行僵尸按其飞行高度判定）
-        for (const z of s.zombies) {
-          const zy = z.y || 0;
-          if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, z.x, z.z, ZOMBIE_RADIUS, ZOMBIE_RADIUS, 0) &&
-              b.y > zy - 0.3 && b.y < zy + 2.0) {
-            z.hp -= 1; hit = true;
-            if (z.hp <= 0) {
-              z.dead = true; s.score += 1;
-              if (b.owner && s.players[b.owner]) s.players[b.owner].kills += 1;
-            }
-            break;
-          }
+        return false;
+      };
+
+      // 生成点(p0)先检一次：消除枪口前约 1.1m 死区（原实现跳过起点）
+      if (testTargets()) { s.bullets.splice(i, 1); continue; }
+
+      for (let st = 0; st < STEPS && !hit; st++) {
+        const px = b.x, pz = b.z;
+        b.x += b.vx * sdt; b.z += b.vz * sdt; b.y += (b.vy || 0) * sdt; b.life -= sdt;
+        if (testTargets()) { hit = true; break; }
+        // 撞围墙/障碍：房主开了反弹则镜面反弹，否则消失（子步内 px→b 已是短线段，墙>0.3m 必被检）
+        if (bulletWorld(obs, b, px, pz, s.bounce)) { hit = true; break; }
+        // 落地：低头打地面 → 消失（开反弹则向上弹起，与墙面镜面反弹一致）
+        if (b.y <= 0) {
+          if (s.bounce) { b.y = -b.y; b.vy = -(b.vy || 0); }
+          else { hit = true; break; }
         }
-      }
-      // 撞围墙/障碍：房主开了反弹则镜面反弹，否则消失
-      if (!hit && bulletWorld(obs, b, px, pz, s.bounce)) hit = true;
-      // 落地：低头打地面 → 消失（开反弹则向上弹起，与墙面镜面反弹一致）
-      if (!hit && b.y <= 0) {
-        if (s.bounce) { b.y = -b.y; b.vy = -(b.vy || 0); }
-        else hit = true;
       }
       if (hit || b.life <= 0) s.bullets.splice(i, 1);
     }
