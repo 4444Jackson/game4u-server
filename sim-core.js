@@ -308,12 +308,14 @@ export class Sim {
   }
 
   _spawnBullet(p) {
+    const speed = this.config.COMBAT.bulletSpeed;
+    // 子弹速度 = 0 → 即时射线(hitscan)：开火瞬间沿视线打一条射线取最近命中，无飞行/无近距死区/无高速隧穿
+    if (speed <= 0) { this._hitscan(p); return; }
     // 视角即弹道：速度向量 = 视线单位向量(yaw+pitch) × 子弹速度，恒速直飞（无重力/加速度）
     const a = p.aim;
     const LIM = Math.PI / 2 - 0.05;   // 与相机 pitch 限位一致
     const pitch = Math.max(-LIM, Math.min(LIM, (p.input && p.input.pitch) || 0));
     const cp = Math.cos(pitch), sp = Math.sin(pitch);
-    const speed = this.config.COMBAT.bulletSpeed;
     const stat = p.stats || computeStats(this.config, p.talent);
     this.state.bullets.push({
       id: this.state.nextBid++,
@@ -327,6 +329,122 @@ export class Sim {
       owner: p.id,
       dmg: stat.damage,        // 预存攻击者单发伤害（含攻击天赋），命中时与受害者防御结算
     });
+  }
+
+  // 伤害结算：命中玩家（对战），收口到一处避免 hitscan / 抛射弹两套口径
+  _applyPlayerDamage(target, dmg, ownerId) {
+    target.hp -= dmg;
+    if (target.hp <= 0) {
+      target.hp = 0;
+      if (ownerId && this.state.players[ownerId]) {
+        this.state.players[ownerId].kills += 1;
+        this.state.events.push({ id: this.state.nextEventId++, killer: ownerId, victim: target.id, t: this.state.matchTime });
+        if (this.state.events.length > 12) this.state.events.shift();
+      }
+      this._killPlayer(target);
+    }
+  }
+
+  // 伤害结算：命中僵尸（浪潮），收口到一处
+  _applyZombieDamage(z, ownerId) {
+    z.hp -= 1;
+    if (z.hp <= 0) {
+      z.dead = true; this.state.score += 1;
+      if (ownerId && this.state.players[ownerId]) this.state.players[ownerId].kills += 1;
+    }
+  }
+
+  // 即时射线(hitscan)：开火瞬间沿视线打一条射线，取最近命中即结算——无飞行/无近距死区/无高速隧穿。
+  // 子弹速度=0 时由 _spawnBullet 调用（CS2 / Valorant 式判定）。墙用射线-AABB 阻挡，与抛射弹同口径。
+  _hitscan(p) {
+    const s = this.state;
+    const obs = s.obstacles;
+    const a = p.aim;
+    const LIM = Math.PI / 2 - 0.05;
+    const pitch = Math.max(-LIM, Math.min(LIM, (p.input && p.input.pitch) || 0));
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const ox = p.x + Math.sin(a) * cp * 1.1;     // 射线起点 = 枪口（与抛射弹出膛点一致）
+    const oz = p.z + Math.cos(a) * cp * 1.1;
+    const oy = p.y + BULLET_EYE + sp * 1.1;
+    const dx = Math.sin(a) * cp, dz = Math.cos(a) * cp, dy = sp;   // 单位方向
+    const stat = p.stats || computeStats(this.config, p.talent);
+    const dmg = stat.damage;
+    const RANGE = 300;                  // 最大射程（米），足够覆盖整张地图；墙/目标更近则提前终止
+    let bestT = RANGE, hitPlayer = null, hitZombie = null;
+    if (s.mode === 'versus' && s.status === 'playing') {
+      for (const id in s.players) {
+        const q = s.players[id];
+        if (!q.alive || q.id === p.id) continue;
+        const t = this._rayCylinder(ox, oz, oy, dx, dz, dy, q.x, q.z, q.radius,
+          q.y - 0.2, q.y + VISUAL_H * (q.stats ? q.stats.scale : 1) + 0.5);
+        if (t >= 0 && t < bestT) { bestT = t; hitPlayer = q; hitZombie = null; }
+      }
+    } else {
+      for (const z of s.zombies) {
+        const zy = z.y || 0;
+        const t = this._rayCylinder(ox, oz, oy, dx, dz, dy, z.x, z.z, ZOMBIE_RADIUS, zy - 0.3, zy + 2.0);
+        if (t >= 0 && t < bestT) { bestT = t; hitZombie = z; hitPlayer = null; }
+      }
+    }
+    // 墙：射线-AABB，若比目标更近则挡住（不结算）
+    const wallT = this._rayWalls(ox, oy, oz, dx, dy, dz, obs, bestT);
+    let endT = bestT;
+    if (wallT >= 0 && wallT < bestT) { endT = wallT; hitPlayer = null; hitZombie = null; }
+    if (hitPlayer) this._applyPlayerDamage(hitPlayer, Math.max(dmg - (hitPlayer.stats ? hitPlayer.stats.defense : 0), 1), p.id);
+    else if (hitZombie) this._applyZombieDamage(hitZombie, p.id);
+    // 视觉 tracer：从枪口飞到命中点（或墙 / 最大射程），短生命后消失，复用既有子弹渲染
+    const TRACER_LIFE = 0.09;
+    const v = Math.max(40, endT / TRACER_LIFE);
+    s.bullets.push({
+      id: s.nextBid++, x: ox, z: oz, y: oy,
+      vx: dx * v, vz: dz * v, vy: dy * v, life: TRACER_LIFE, owner: p.id, dmg: 0, tracer: true,
+    });
+  }
+
+  // 射线 vs 竖直圆柱（XZ 圆 + 高度带）：返回沿射线最近命中距离 t(≥0)，无命中返回 -1
+  _rayCylinder(ox, oz, oy, dx, dz, dy, cx, cz, r, y0, y1) {
+    const a = dx * dx + dz * dz;
+    if (a < 1e-9) {            // 视线水平无分量（纯上下）：仅当已在柱内且高度带覆盖
+      const d = Math.hypot(ox - cx, oz - cz);
+      return d <= r && oy >= y0 && oy <= y1 ? 0 : -1;
+    }
+    const bx = ox - cx, bz = oz - cz;
+    const b = 2 * (bx * dx + bz * dz);
+    const c = bx * bx + bz * bz - r * r;
+    const disc = b * b - 4 * a * c;
+    if (disc < 0) return -1;
+    const sq = Math.sqrt(disc);
+    const t1 = (-b - sq) / (2 * a);     // 进入点
+    const cand = [];
+    if (t1 >= 0) cand.push(t1);
+    else if ((-b + sq) / (2 * a) > 0) cand.push(0);   // 原点已在柱内，立即命中
+    for (const t of cand) {
+      const yy = oy + t * dy;
+      if (yy >= y0 && yy <= y1) return t;
+    }
+    return -1;
+  }
+
+  // 射线 vs 障碍盒（AABB：x±w/2, y∈[0,t], z±d/2）：返回最近进入距离 t(≥0)，无命中返回 -1（不超过 maxT）
+  _rayWalls(ox, oy, oz, dx, dy, dz, boxes, maxT) {
+    let best = -1;
+    for (const box of boxes) {
+      const minX = box.x - box.w / 2, maxX = box.x + box.w / 2;
+      const minZ = box.z - box.d / 2, maxZ = box.z + box.d / 2;
+      const minY = 0, maxY = box.t;
+      let tmin = -Infinity, tmax = Infinity;
+      if (Math.abs(dx) < 1e-9) { if (ox < minX || ox > maxX) continue; }
+      else { let t1 = (minX - ox) / dx, t2 = (maxX - ox) / dx; if (t1 > t2) [t1, t2] = [t2, t1]; tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2); }
+      if (Math.abs(dy) < 1e-9) { if (oy < minY || oy > maxY) continue; }
+      else { let t1 = (minY - oy) / dy, t2 = (maxY - oy) / dy; if (t1 > t2) [t1, t2] = [t2, t1]; tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2); }
+      if (Math.abs(dz) < 1e-9) { if (oz < minZ || oz > maxZ) continue; }
+      else { let t1 = (minZ - oz) / dz, t2 = (maxZ - oz) / dz; if (t1 > t2) [t1, t2] = [t2, t1]; tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2); }
+      if (tmax < tmin) continue;
+      if (tmin > maxT) continue;
+      const t = tmin >= 0 ? tmin : (tmax >= 0 ? 0 : -1);
+      if (t >= 0 && (best < 0 || t < best)) best = t;
+    }
+    return best;
   }
 
   _spawnZombie() {
@@ -449,6 +567,11 @@ export class Sim {
     // 生成点(p0)单独检一次，覆盖枪口前那一段（原端点检测跳过的起点）
     for (let i = s.bullets.length - 1; i >= 0; i--) {
       const b = s.bullets[i];
+      if (b.tracer) {                 // hitscan 视觉 tracer：不结算碰撞，仅飞行 + 短生命后消失
+        b.x += b.vx * dt; b.z += b.vz * dt; b.y += (b.vy || 0) * dt; b.life -= dt;
+        if (b.life <= 0) s.bullets.splice(i, 1);
+        continue;
+      }
       const byaw = Math.atan2(b.vx, b.vz);   // 子弹朝向（沿飞行方向）
       const travel = Math.hypot(b.vx, b.vz, b.vy || 0) * dt;
       const STEPS = Math.max(1, Math.ceil(travel / 0.3));
@@ -465,16 +588,7 @@ export class Sim {
             if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, p.x, p.z, p.radius, p.radius, p.aim) &&
                 b.y > p.y - 0.2 && b.y < p.y + VISUAL_H * (p.stats ? p.stats.scale : 1) + 0.5) {
               const dmg = Math.max((b.dmg || this.config.COMBAT.baseDamage) - (p.stats ? p.stats.defense : 0), 1);
-              p.hp -= dmg;
-              if (p.hp <= 0) {
-                p.hp = 0;
-                if (b.owner && s.players[b.owner]) {
-                  s.players[b.owner].kills += 1;
-                  s.events.push({ id: s.nextEventId++, killer: b.owner, victim: p.id, t: s.matchTime });
-                  if (s.events.length > 12) s.events.shift();
-                }
-                this._killPlayer(p);
-              }
+              this._applyPlayerDamage(p, dmg, b.owner);
               return true;
             }
           }
@@ -484,11 +598,7 @@ export class Sim {
             const zy = z.y || 0;
             if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, z.x, z.z, ZOMBIE_RADIUS, ZOMBIE_RADIUS, 0) &&
                 b.y > zy - 0.3 && b.y < zy + 2.0) {
-              z.hp -= 1;
-              if (z.hp <= 0) {
-                z.dead = true; s.score += 1;
-                if (b.owner && s.players[b.owner]) s.players[b.owner].kills += 1;
-              }
+              this._applyZombieDamage(z, b.owner);
               return true;
             }
           }
