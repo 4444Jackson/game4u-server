@@ -105,8 +105,8 @@ html, body {
 .hud { position: fixed; inset: 0; z-index: 50; pointer-events: none; }
 #hud-top {
   position: absolute; top: max(14px, env(safe-area-inset-top)); left: 0; right: 0;
-  display: flex; justify-content: space-between; gap: 14px; padding: 0 72px;
-  font-size: 15px; font-weight: 700; text-shadow: 0 1px 3px #000;
+  display: flex; justify-content: center; gap: 14px; font-size: 15px; font-weight: 700;
+  text-shadow: 0 1px 3px #000;
 }
 #hud-players {
   position: absolute; top: max(50px, calc(env(safe-area-inset-top) + 40px)); left: 12px;
