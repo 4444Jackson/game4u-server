@@ -614,11 +614,10 @@ function startLoop() {
 
 }
 
-// 停止渲染/模拟循环（软复位用）：置 false 让 rAF 链自然断；清模拟定时器
+// 停止渲染循环（软复位用）：置 false 让 rAF 链自然断；U4 的 setTimeout 循环需显式清
 function stopLoop() {
   loopRunning = false;
   if (_loopTimer) { clearTimeout(_loopTimer); _loopTimer = null; }   // U4 setTimeout 循环需显式清，否则回大厅后仍在渲染
-  if (simTimer) { clearInterval(simTimer); simTimer = null; }
 }
 
 // ---------------- 全屏切换（FPS 常见：F 键 / 按钮，兼容 iOS webkit）----------------
