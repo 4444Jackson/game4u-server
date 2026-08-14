@@ -496,7 +496,7 @@ function ensureFpsHud() {
   _fpsEl = document.createElement('div');
   _fpsEl.id = 'fps-hud';
   _fpsEl.textContent = '-- FPS';
-  _fpsEl.style.cssText = 'position:fixed;top:4px;right:6px;z-index:30;'
+  _fpsEl.style.cssText = 'position:fixed;top:4px;left:50%;transform:translateX(-50%);z-index:55;'
     + 'font:600 12px/1.3 ui-monospace,Menlo,Consolas,monospace;'
     + 'color:#7CFFB2;background:rgba(0,0,0,.42);padding:2px 7px;border-radius:7px;'
     + 'pointer-events:none;-webkit-user-select:none;user-select:none;letter-spacing:.3px;';
@@ -512,7 +512,7 @@ function ensurePingHud() {
   _pingEl = document.createElement('div');
   _pingEl.id = 'ping-hud';
   _pingEl.textContent = '📶 --';
-  _pingEl.style.cssText = 'position:fixed;top:26px;right:6px;z-index:30;'
+  _pingEl.style.cssText = 'position:fixed;top:26px;left:50%;transform:translateX(-50%);z-index:55;'
     + 'font:600 12px/1.3 ui-monospace,Menlo,Consolas,monospace;'
     + 'color:#9aa0a6;background:rgba(0,0,0,.42);padding:2px 7px;border-radius:7px;'
     + 'pointer-events:none;-webkit-user-select:none;user-select:none;letter-spacing:.3px;';

@@ -105,8 +105,8 @@ html, body {
 .hud { position: fixed; inset: 0; z-index: 50; pointer-events: none; }
 #hud-top {
   position: absolute; top: max(14px, env(safe-area-inset-top)); left: 0; right: 0;
-  display: flex; justify-content: center; gap: 14px; font-size: 15px; font-weight: 700;
-  text-shadow: 0 1px 3px #000;
+  display: flex; justify-content: space-between; gap: 14px; padding: 0 72px;
+  font-size: 15px; font-weight: 700; text-shadow: 0 1px 3px #000;
 }
 #hud-players {
   position: absolute; top: max(50px, calc(env(safe-area-inset-top) + 40px)); left: 12px;
@@ -248,7 +248,7 @@ html, body {
   position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
   width: min(92vw, 360px); max-height: 84vh; overflow-y: auto;
   background: var(--panel); border: 1px solid #2c3744; border-radius: 16px;
-  padding: 20px; z-index: 40; display: flex; flex-direction: column; gap: 10px;
+  padding: 20px; z-index: 60; display: flex; flex-direction: column; gap: 10px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, .6);
 }
 .settings-panel h3 { margin: 0 0 6px; font-size: 18px; text-align: center; }
