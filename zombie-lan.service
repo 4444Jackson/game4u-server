@@ -7,7 +7,7 @@
 #   看日志：sudo journalctl -u zombie-lan -f
 
 [Unit]
-Description=Game4U 多人联机
+Description=Game4U 多人联机权威游戏服务器
 After=network.target
 
 [Service]

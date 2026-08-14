@@ -1,32 +1,14 @@
-// net.js — 网络层封装（浏览器中继客户端 + 原生 APK 桥；上层 main.js/game.js 通过统一接口调用）
-// 传输层分两种，上层(main.js/game.js)通过统一接口调用，不感知差异：
-//   • APK 原生桥 (window.ZombieLan, Java)：主机 TCP 服务 + UDP 广播发现，真机联机（零服务器/自动发现）— 情景1
-//   • 浏览器中继 (WebSocket 连本地 relay.cjs)：两电脑 HTML 联机，主机电脑跑免费本地进程当权威服务器 — 情景2
-//
-// 重要：情景2 下浏览器(无论建房还是加入)都是 relay 的「玩家」，协议统一（多房间）：
+// net.js — 网络层封装（浏览器中继客户端）。
+// 本部署是中心化 relay：浏览器一律是 relay 的「玩家」，协议统一（多房间）。
 //   上行 {type:'listRooms'} / {type:'createRoom',name,playerName,mode,lives,target,bounce,zmix}
 //        / {type:'joinRoom',roomId,name} / {type:'input',...} / {type:'startGame',mode,lives,target,bounce,zmix}
 //   下行 {type:'roomList',rooms} / {type:'welcome',id,roomId} / {type:'state',...}（权威快照，由 relay 里的 Sim 算出）
+//        / {type:'static',...}（一次性地形+房主配置）
 //   mode: 'wave' 僵尸浪潮 | 'versus' 对战
 //   lives: 命条数（房主设定；wave 也生效，0 = 无限命）；target: 僵尸浪潮击杀目标（0 = 无尽生存）
 //   注意：connect() 只建立 WebSocket，不再自动 join；建房/加入由 createRoom/joinRoom 显式触发。
 
-const bridge = (typeof window !== 'undefined') ? window.ZombieLan : null;
-export const HAS_NATIVE = !!bridge;
-export const HAS_CAP = HAS_NATIVE;
-
-export const DEFAULT_PORT = 5000;
-export const DEFAULT_BROADCAST_PORT = 5001;
 export const RELAY_PORT = 8123;
-
-if (typeof window !== 'undefined') window.ZB = window.ZB || {};
-
-function call(method, arg) {
-  if (!bridge) return null;
-  const r = bridge[method](arg ? JSON.stringify(arg) : '');
-  if (typeof r === 'string' && r.length) { try { return JSON.parse(r); } catch (_) { return r; } }
-  return r;
-}
 
 // 中继地址：URL ?host=IP 优先；否则页面由 relay 注入的 __RELAY_WS__；都没有则回退本机
 export function relayUrl() {
@@ -46,129 +28,6 @@ function connectRelay(url) {
     ws.onopen = () => { clearTimeout(to); resolve(ws); };
     ws.onerror = () => { clearTimeout(to); reject(new Error('relay 连接失败（确认服务器已运行 relay）')); };
   });
-}
-
-// ---------------- 原生(APK)专用网络层 ----------------
-// 【命名注意】叫 HostNet 但它并不等于「房主」，而是【主机】：本机跑权威模拟(game.js)时用的传输层。
-// 唯一实例化点是 main.js 的 `HAS_NATIVE ? new HostNet() : new ClientNet()`，所以浏览器（含网页建房者）
-// 永远拿到 ClientNet —— 网页建房只是房主，模拟在 relay 上，它在网络意义上仍是客户端。
-// 因此 start() 里那条非原生的连 relay 分支实际不可达，仅作兜底保留。
-// 附带结论：hostChanged / nudgeHost 这类 relay 消息只会到 ClientNet，APK 侧收不到，
-// 故「接任房主」不可能发生在 APK 上（也就不会误触发本地权威模拟）。
-export class HostNet {
-  constructor() {
-    this.ip = 'dev';
-    this.port = DEFAULT_PORT;
-    this.ws = null;
-    this._name = '玩家' + Math.floor(Math.random() * 900 + 100);
-    this.connected = false;
-    this._onState = null;
-    this._onRoomList = null;
-    this._onRoomFound = null;
-    this._onHostDropped = null;
-    this._onClientConnected = null;
-    this._onClientDisconnected = null;
-    this._onClientMessage = null;
-  }
-
-  async start(roomName, port = DEFAULT_PORT, broadcastPort = DEFAULT_BROADCAST_PORT) {
-    if (HAS_NATIVE) {
-      const r = call('startHost', { roomName, port, broadcastPort });
-      this.ip = r.ip; this.port = r.port;
-      return r;
-    }
-    // 情景2：作为玩家连入中继（建房者的本机已在跑 relay）。仅连 WS，建房由 createRoom 触发。
-    const url = relayUrl() || `ws://localhost:${RELAY_PORT}`;
-    this.ws = await connectRelay(url);
-    this._bindWs();
-    this.ip = (typeof location !== 'undefined') ? location.hostname : 'localhost';
-    this.port = RELAY_PORT;
-    console.log('[net-relay] 主机(玩家)接入中继', url);
-    return { ip: this.ip, port: this.port };
-  }
-
-  _bindWs() {
-    if (!this.ws) return;
-    this.ws.onmessage = (e) => {
-      let m; try { m = JSON.parse(e.data); } catch (_) { return; }
-      if (m.type === 'welcome') { this._onState && this._onState(m); if (this._welcomeResolver) { this._welcomeResolver(m); this._welcomeResolver = null; } }
-      else if (m.type === 'state') this._onState && this._onState(m);
-    };
-  }
-
-  onState(cb) { this._onState = cb; if (HAS_NATIVE) window.ZB.onState = (data) => { try { cb(JSON.parse(data)); } catch (_) {} }; }
-  // APK 原生桥无 relay RTT（延迟 HUD 在原生情景下不显示），这里留空实现保持接口一致
-  onRtt(cb) { this._onRtt = cb; }
-  // 原生主机不通过 WS 接收 roomList（房间即本机单房），但需实现统一接口，避免上层无条件调用崩溃
-  onRoomList(cb) { this._onRoomList = cb; }
-  // 原生主机无需列出远程房间（它本身就是唯一房间）；加入/搜索走原生 TCP/UDP 发现，不走 WS listRooms
-  listRooms() { /* no-op：原生情景下无远端房间列表可拉 */ }
-
-  // ---- 以下为原生(情景1)【客户端】加入远端主机所需（APK↔APK）----
-  setName(name) { this._name = name; }
-
-  // 收到 UDP 广播发现的主机列表（Java startScan → window.ZB.onRoomFound）
-  onRoomFound(cb) {
-    this._onRoomFound = cb;
-    if (HAS_NATIVE) window.ZB.onRoomFound = (data) => { try { cb(JSON.parse(data)); } catch (_) {} };
-  }
-
-  // 与主机 TCP 连接意外断开（游戏中主机掉线）：回调由上层弹提示并退回菜单
-  onHostDropped(cb) { this._onHostDropped = cb; }
-
-  // 启动局域网 UDP 扫描，发现主机（主机通过广播公告自身）
-  scan() { if (HAS_NATIVE) call('startScan', { broadcastPort: DEFAULT_BROADCAST_PORT }); }
-  stopScan() { if (HAS_NATIVE) call('stopScan'); }
-
-  // 以客户端身份 TCP 连接远端主机（port 默认 5000）。连接成功 resolve；失败/掉线 reject
-  connectClient(ip, port = DEFAULT_PORT) {
-    return new Promise((resolve, reject) => {
-      if (!HAS_NATIVE) { reject(new Error('仅原生支持')); return; }
-      this.connected = false;   // 每次连接尝试都从「未连接」起步，确保失败时走 reject 而非 onHostDropped
-      window.ZB._connectResolve = () => { this.connected = true; resolve(); };
-      window.ZB._connectReject = (msg) => {
-        if (this.connected) { if (this._onHostDropped) this._onHostDropped(); }
-        else reject(new Error(msg || 'connect-failed'));
-      };
-      call('connect', { ip, port, name: this._name });
-    });
-  }
-  // 以下仅为原生(情景1)主机保留；中继模式下用不到
-  onClientConnected(cb) { this._onClientConnected = cb; if (HAS_NATIVE) window.ZB.onClientConnected = cb; }
-  onClientDisconnected(cb) { this._onClientDisconnected = cb; if (HAS_NATIVE) window.ZB.onClientDisconnected = cb; }
-  onClientMessage(cb) {
-    this._onClientMessage = cb;
-    if (HAS_NATIVE) window.ZB.onClientMessage = (cid, data) => { try { cb(cid, JSON.parse(data)); } catch (_) { cb(cid, data); } };
-  }
-
-  broadcast(data) {
-    if (HAS_NATIVE) { call('broadcast', { data: JSON.stringify(data) }); return; }
-    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(data));
-  }
-  sendTo(cid, data) {
-    if (HAS_NATIVE) { call('sendTo', { clientId: cid, data: JSON.stringify(data) }); return; }
-    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(data));
-  }
-  // 原生客户端上行消息（joinRoom/input/talent 等）到远端主机（走 TCP，由 Java 转发到主机 onClientMessage）
-  send(obj) {
-    if (HAS_NATIVE) { call('send', { data: JSON.stringify(obj) }); return; }
-    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
-  }
-  stop() {
-    if (HAS_NATIVE) { call('stopHost'); return; }
-    if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
-  }
-  // 退出/返回：原生(情景1)下既断开客户端 TCP(若连着远端主机)，也停掉本机主机服务(若自己是主机)
-  // —— 两种角色共用 HostNet，close 对不适用的一侧是无害空操作。
-  close() {
-    if (HAS_NATIVE) { call('disconnect'); call('stopHost'); return; }
-    if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
-  }
-
-  // 把权威快照(已 JSON 字符串)推给所有经 WS 加入的浏览器客户端（手机原生主机桥接用）
-  pushWsState(json) {
-    if (HAS_NATIVE && json) call('pushWsState', { data: json });
-  }
 }
 
 // ---------------- 客户端（中继多房间）----------------
@@ -193,17 +52,7 @@ export class ClientNet {
   setName(name) { this._name = name; }
 
   async connect(ip, port = RELAY_PORT) {
-    if (HAS_NATIVE) {
-      return new Promise((resolve, reject) => {
-        this._resolve = resolve; this._reject = reject;
-        if (typeof window !== 'undefined') {
-          window.ZB._connectResolve = () => { this.connected = true; resolve(); };
-          window.ZB._connectReject = (msg) => { this.connected = false; reject(new Error(msg || 'connect-failed')); };
-        }
-        call('connect', { ip, port, name: this._name });
-      });
-    }
-    // 情景2：作为玩家连入中继（ip 为空=用页面注入地址；否则连指定主机IP）。仅连 WS，不自动 join。
+    // 作为玩家连入中继（ip 为空=用页面注入地址；否则连指定主机IP）。仅连 WS，不自动 join。
     const url = (ip && ip !== 'localhost' && ip !== '127.0.0.1')
       ? `ws://${ip}:${port}`
       : (relayUrl() || `ws://localhost:${port}`);
@@ -288,10 +137,9 @@ export class ClientNet {
 
   onState(cb) {
     this._onState = cb;
-    if (HAS_NATIVE) window.ZB.onState = (data) => { try { cb(JSON.parse(data)); } catch (_) {} };
   }
 
-  // RTT 延迟回调（「王者460」式 HUD 用）。浏览器中继(ClientNet)下由 pong 回显驱动；APK 原生桥无 relay RTT，回调不触发。
+  // RTT 延迟回调（「王者460」式 HUD 用），由 pong 回显驱动。
   onRtt(cb) { this._onRtt = cb; }
 
   onRoomList(cb) { this._onRoomList = cb; }
@@ -335,7 +183,6 @@ export class ClientNet {
   sendReady(ready) { this.send({ type: 'ready', ready: !!ready }); }
 
   send(obj) {
-    if (HAS_NATIVE) { call('send', { data: JSON.stringify(obj) }); return; }
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
   }
   close() {
@@ -343,7 +190,6 @@ export class ClientNet {
     this.connected = false;
     if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
-    if (HAS_NATIVE) { call('disconnect'); return; }
     if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
   }
 }

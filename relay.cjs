@@ -6,7 +6,7 @@
 //
 // 玩家连入流程：listRooms 看房间列表 → createRoom 建房（建房者即房主）→ joinRoom 选房加入。
 //
-// 与本地旧版（ZombieLAN：房主浏览器即主机 + WebRTC P2P）的区别：
+// 与本地旧版（房主浏览器即主机 + WebRTC P2P）的区别：
 //   1) 去掉 WebRTC / werift 中继层 —— 中心化服务器下数据通道也是「浏览器↔服务器」，省不了服务器负载，
 //      反而每个连接要在 Node 内起一个 PeerConnection、很吃内存；改为纯 WebSocket 后运行时零 npm 依赖。
 //   2) 页面 WS 地址 wss:// 自适应：页面走 https 时自动用 wss://，否则 ws://
@@ -23,7 +23,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8123;
-// 模拟+广播帧率：默认 60Hz（与原版 zombie-lan 一致）。step 的 dt 与此同步，物理保持实时。
+// 模拟+广播帧率：默认 60Hz（与本地原版游戏一致）。step 的 dt 与此同步，物理保持实时。
 // 若同时开很多房、服务器 CPU/带宽吃紧，可设 TICK_HZ=30 约减半负载；客户端靠插值平滑，手感略顿。
 const TICK_HZ = (process.env.TICK_HZ && Number(process.env.TICK_HZ) > 0) ? Number(process.env.TICK_HZ) : 60;
 const TICK_DT = 1 / TICK_HZ;

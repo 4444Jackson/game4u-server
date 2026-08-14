@@ -1,8 +1,7 @@
 // main.js — 主控：菜单 / 建房(主机) / 加入(客户端) / 游戏循环
 import './styles.css';
 import { Game } from './game.js';
-import { HostNet, ClientNet, HAS_CAP, HAS_NATIVE, relayUrl } from './net.js';
-import { createWsHandlers } from './wsbridge.js';
+import { ClientNet, relayUrl } from './net.js';
 import { Controls, updateHud, loadSettings, saveSettings, defaultSettings, lockPointer, unlockPointer, lockLandscape, unlockOrientation, centerNotify } from './ui.js';
 import { GAME_CONFIG, talentCost, talentTotalCost } from '../gameConfig.js';
 
@@ -62,18 +61,13 @@ function closeOverlays() {
 }
 
 // ============ 「主机」与「房主」是两回事，切勿混用 ============
-// 【主机 host】= 谁在跑权威模拟。APK 建房时是本机(game.js)；relay 情景下是 relay 进程(sim-core.js)，
-//               浏览器一方永远不是主机。由 mode + HAS_NATIVE 共同决定，见 isLocalSim()。
+// 【主机 host】= 谁在跑权威模拟。本部署是中心化 relay 进程(sim-core.js)，浏览器一方永远只是客户端。
 // 【房主 owner】= 谁有开局/重开权（relay 侧的 room.hostCid）。只是一个权限标记，可以移交。
-//               relay 情景下房主并不跑模拟，所以房主换人不影响谁是主机。
-// 二者只在 APK 建房时重合（同一台手机既是主机又是房主）；relay 情景下必然分离。
+//               房主并不跑模拟，所以房主换人不影响谁是主机。
 let mode = null;        // 网络角色：'host'=自己建的房 | 'client'=加入别人的房。**不表示房主权限**
 let net = null;
 let myId = 'host';
-// 本地是否跑权威模拟（=我是不是「主机」）。只有 APK 建房这一种情况成立：
-// 浏览器建房时模拟在 relay 上，APK 客户端时模拟在对方手机上，都不是本地主机。
-// 【禁止】用 isRoomOwner 代替它——接任房主拿到的是权限，不是模拟权，误判会起第二套模拟与 relay 打架。
-const isLocalSim = () => (HAS_NATIVE && mode === 'host');
+// 本部署是中心化 relay：浏览器永远是客户端，绝不跑权威模拟（模拟只在 relay 进程的 sim-core.js 上）。
 // 是否持有房主权限（开局/重开）。建房即为真；relay 移交(hostChanged)后接任者也为真。
 // 【禁止】用 mode === 'host' 代替它——那是网络角色，接任房主的 mode 仍是 'client'。
 let isRoomOwner = false;
@@ -98,7 +92,6 @@ function loadPid() {
 let myName = loadName();
 const myPid = loadPid();
 let loopRunning = false;
-let simTimer = null;    // 仅手机原生(情景1)主机本地模拟用
 
 // 开房间时选中的游戏类型（房主设定，权威）
 let gameMode = 'wave';  // 'wave' 僵尸浪潮 | 'versus' 对战（无僵尸）
@@ -151,8 +144,7 @@ function _talentCfg() {
 }
 function _sendTalentNow() {
   const t = { ...talent };
-  if (isLocalSim()) { if (game && game.setTalent) game.setTalent('host', t); }   // 仅本地主机可直接改权威数据（'host' 是本地主机的玩家 id，非房主标记）
-  else if (net && net.sendTalent) net.sendTalent(t);
+  if (net && net.sendTalent) net.sendTalent(t);
 }
 // 每帧驱动（签名不变则零 DOM 操作）：显示条件 = 对战 && 天赋点 > 0 && (等待房 || 我方死亡等复活)
 //   —— 等待房：早到玩家(含房主)开局前配置；复活窗口：死亡→复活倒计时期间可「重装上阵」重新调配
@@ -202,7 +194,7 @@ const settings = loadSettings();
 
 // ---------------- 建立网络连接（只连 WS，不自动 join；建房/加入由 createRoom/joinRoom 触发）----------------
 async function connectNet() {
-  net = HAS_NATIVE ? new HostNet() : new ClientNet();
+  net = new ClientNet();
   if (net.setName) net.setName(myName);
   // 注册状态回调（welcome 设置 myId；state 应用快照；roomList 渲染房间列表）
   net.onState((snap) => {
@@ -237,7 +229,6 @@ async function connectNet() {
     if (snap.type === 'hostChanged') {   // 原房主退出，relay 已把房主移交给房内剩余第一人
       if (snap.hostId === myId) {
         // 【只提升房主权限，绝不改 mode】权威模拟仍在 relay 上，我依旧是网络意义上的客户端。
-        // 若在此写 mode = 'host'，isLocalSim() 在 APK 客户端上会变真 → 本机起第二套权威模拟与 relay 对撞。
         isRoomOwner = true; isPromotedOwner = true;
         const rb = el('btn-restart'); if (rb) rb.textContent = '再来一局';   // 权限变了，按钮文案必须跟着变
         refreshStartBtn();                                                   // 等待房的「开始」按钮也要放出来
@@ -259,115 +250,15 @@ async function connectNet() {
   net.onRoomList((list) => renderRoomList(list));
   // 「王者460」式延迟 HUD：每收到一次 pong 回显就刷新（net.js ClientNet 每 1s 测一次 RTT）
   net.onRtt((rtt) => updatePingHud(rtt));
-  if (HAS_NATIVE) {
-    if (mode === 'client') {
-      // 情景1【客户端】：仅注册回调，不启主机（避免变成自己的主机）；
-      // 真正的扫描/连接由 doSearch/joinNative 触发。
-      net.onRoomFound((host) => onNativeRoomFound(host));
-      net.onHostDropped(() => { alert('与主机断开连接'); if (net.stopScan) net.stopScan(); show('menu'); hide('hud'); });
-      el('hud-status').textContent = '搜索房间中…';
-    } else {
-      // 情景1：手机原生桥（host 本地跑模拟）
-      const info = await net.start(myName);
-
-      // —— 浏览器经 WS(8123) 加入同一局的桥（复用 relay 协议，浏览器客户端零改动）——
-      let _wsIsHost = false;
-      const _wsH = createWsHandlers({
-        getGame: () => game,
-        getRoomName: () => myName,
-        getIsHost: () => _wsIsHost,
-        setIsHost: (b) => { _wsIsHost = b; },
-        onNudge: (name) => centerNotify(`${name} 催你再来一局 🔁`),
-      });
-      window.ZB.wsListRooms = () => JSON.stringify(_wsH.listRooms());
-      window.ZB.wsCreateRoom = (name, mode, lives, target, bounce, zmix, config) =>
-        JSON.stringify(_wsH.createRoom({ name, mode, lives, target, bounce, zmix, config }));
-      window.ZB.wsJoinRoom = (roomId, name, pid) => JSON.stringify(_wsH.joinRoom({ roomId, name, pid }));
-      window.ZB.wsInput = (cid, msg) => _wsH.input(cid, msg);
-      window.ZB.wsTalent = (cid, msg) => _wsH.talent(cid, msg);
-      window.ZB.wsReady = (cid, msg) => _wsH.ready(cid, msg);
-      window.ZB.wsStartGame = (cid, msg) => _wsH.startGame(cid, msg);
-      window.ZB.wsNudge = (cid, msg) => _wsH.nudge(cid, msg);
-      window.ZB.wsLeaveRoom = (cid) => _wsH.leaveRoom(cid);
-      window.ZB.wsRemovePlayer = (cid) => _wsH.removePlayer(cid);
-
-      // 远端客户端（APK 或浏览器）消息路由：
-      //   joinRoom/createRoom → 注册为 sim 玩家并回 welcome（补全原生 APK↔APK 玩家加入）；
-      //   input → hostQueueCmds/hostSetInput；talent → setTalent
-      if (net.onClientConnected) net.onClientConnected(() => {});
-      // 断线 = 置离线（席位保留），不是真删——真删会让对战人数分母塌陷、剩 1 人误判结束
-      // 接管映射：原生 net 每连接分配一个 socketCid；重连接管(takeover)时新 socket 的 sim cid 应指向被认领的旧席位，
-      // 故做一层 socketCid→simCid 重定向，使新 socket 的后续消息都路由到旧席位；
-      // 旧 socket 标 stale，其后续断开不再把刚认领的席位误置离线（否则"两个自己"修完又变"一接就掉"）。
-      const _cidRemap = new Map();
-      const _staleSockets = new Set();
-      if (net.onClientDisconnected) net.onClientDisconnected((cid) => {
-        if (!game) return;
-        if (_staleSockets.has(cid)) { _staleSockets.delete(cid); return; }   // 被接管后失效的旧 socket：忽略其断开
-        const eff = _cidRemap.get(cid) || cid;
-        if (eff) { game.hostSetOffline(eff); _cidRemap.delete(cid); }   // hostSetOffline 内部已清 ready 标志位
-      });
-      if (net.onClientMessage) net.onClientMessage((cid, msg) => {
-        if (!game || !msg || typeof msg !== 'object') return;
-        const eff = _cidRemap.get(cid) || cid;   // 重连接管后所有消息重定向到被认领的旧席位
-        if (msg.type === 'joinRoom' || msg.type === 'createRoom') {
-          const nm = (msg.name || msg.playerName || '玩家').toString().slice(0, 16);
-          const pid = (msg.pid || '').toString().slice(0, 64);
-          const old = game.hostClaimSeat(pid);   // 现统一返回 cid（不论旧席位是否在线），命中即接管
-          if (old) {
-            // 旧 socket 若仍在线 → 标 stale，使其后续断开不再 offline 本席位
-            for (const [sc, simCid] of _cidRemap) {
-              if (simCid === old && sc !== cid) { _staleSockets.add(sc); _cidRemap.delete(sc); }
-            }
-            const sp = game.state.players[old];
-            if (sp) sp.name = nm;
-            // 仅旧席位离线(state===0)才"当刷进来"；在线(state===1，接管刷新/第二标签页)保持状态不瞬移
-            if (sp && sp.state === 0) game.hostSetOnline(old);
-            _cidRemap.set(cid, old);
-            if (net.sendTo) net.sendTo(cid, { type: 'welcome', id: old, roomId: 'r1', resumed: !!(sp && sp.state === 0) });
-            return;
-          }
-          if (!game.state.players[cid]) game.hostAddPlayer(cid, nm);
-          game.hostBindPid(pid, cid);
-          _cidRemap.set(cid, cid);
-          if (net.sendTo) net.sendTo(cid, { type: 'welcome', id: cid, roomId: 'r1' });
-          return;
-        }
-        if (msg.type === 'ready') { game.hostSetReady(eff, msg.ready !== false); return; }
-        if (msg.type === 'leaveRoom') {
-          game.hostSetOffline(eff); _cidRemap.delete(cid);   // hostSetOffline 内部已清 ready 标志位
-          if (net.sendTo) net.sendTo(cid, { type: 'leftRoom' }); return;
-        }
-        if (msg.type === 'input') {
-          if (Array.isArray(msg.cmds)) game.hostQueueCmds(eff, msg.cmds);
-          else game.hostSetInput(eff, msg);
-        } else if (msg.type === 'talent' && game.setTalent) {
-          game.setTalent(eff, msg.talent || {});
-        } else if (msg.type === 'nudgeHost') {
-          // 原生 APK 客户端催房主重开：主机弹中央提示（房主手动点「再来一局」）
-          centerNotify(`${msg.name || '玩家'} 催你再来一局 🔁`);
-        }
-      });
-      el('hud-status').textContent = `主机 ${info.ip}:${info.port}`;
-      const hi = el('host-info');
-      if (hi) {
-        const wp = info.wsPort || 8123;
-        hi.classList.remove('hidden');
-        hi.innerHTML = `游戏地址：<b>${location.origin}</b>　·　把这个地址发给好友，他们打开即可搜索并加入你的房间`;
-      }
-    }
-  } else {
-    // 情景2：浏览器连 relay。地址由 relay 注入页面的 window.__RELAY_WS__（= "ws://"+location.host）接管，
-    // 跨设备打开即自动连对；?host= URL 参数仍可手动覆盖。原 #host-input 输入框已移除（冗余化石）。
-    const ip = null;
-    const info = await net.connect(ip);
-    el('hud-status').textContent = '已连接房间';
-    // 显示本游戏公网地址，供好友打开同一地址搜索并加入房间
-    const hi = el('host-info');
-    if (hi) {
-      hi.classList.remove('hidden');
-      hi.innerHTML = `游戏地址：<b>${location.origin}</b>　·　把这个地址发给好友，他们打开即可搜索并加入你的房间`;
-    }
+  // 浏览器连中心化 relay（权威服务器）。地址由 relay 注入页面的 window.__RELAY_WS__ 接管，跨设备打开即自动连；
+  // ?host= URL 参数仍可手动覆盖。
+  const ip = null;
+  await net.connect(ip);
+  el('hud-status').textContent = '已连接房间';
+  const hi = el('host-info');
+  if (hi) {
+    hi.classList.remove('hidden');
+    hi.innerHTML = `游戏地址：<b>${location.origin}</b>　·　把这个地址发给好友，他们打开即可搜索并加入你的房间`;
   }
 }
 
@@ -421,16 +312,14 @@ function enterGame(isHost) {
   // 不再用 33ms 定时器发"按键状态"（状态式起停/变向生效时长与服务器差 1~2 tick → 持续对账回拉 = 460 感）。
   // 改为：渲染帧循环里每帧喂输入 → game.predictTick 按固定 1/60 切成带 seq 的指令
   // → 本地立即模拟（零延迟）→ 经 onCmds 批量上行 → 服务器逐条精确模拟并回 ack → 客户端回滚重放。
-  if (!isLocalSim()) {   // 非本地主机（含 relay 情景下的房主/接任房主）都要把输入上行给权威端
-    if (game) game.onCmds = (cmds) => { if (net && net.send) net.send({ type: 'input', cmds }); };
-  }
+  if (game) game.onCmds = (cmds) => { if (net && net.send) net.send({ type: 'input', cmds }); };
   startLoop();
 }
 
 // ---------------- 主机（建房）流程 ----------------
 // opts = { bounce, zmix }：子弹反弹开关 / 僵尸出现方式（房主在 mode-select 选定）
 async function startHost(gm, lv, opts) {
-  // 自己建的房：网络角色 host（APK 时同时成为本地主机），并天然持有房主权限；玩法由本地选项决定，非接任
+  // 自己建的房：网络角色 host（浏览器建房者），并天然持有房主权限；玩法由本地选项决定，非接任
   mode = 'host'; myId = 'host'; isRoomOwner = true; isPromotedOwner = false;
   { const rb = el('btn-restart'); if (rb) rb.textContent = '再来一局'; }   // 房主直接重开：文案随身份刷新（初始化只设过一次，房主路径必须再校正）
   if (gm) gameMode = gm;
@@ -446,13 +335,11 @@ async function startHost(gm, lv, opts) {
   game.hostInit(myName);
   game.state.mode = gameMode;   // 等待房阶段本地立即持有正确 mode（天赋面板显隐依赖它；relay 快照到达前也正确）
   const vc = versusConfig();
-  if (vc && game.setConfig) game.setConfig(vc);   // 原生主机路径：本地应用房主配置
+  if (vc && game.setConfig) game.setConfig(vc);   // 浏览器建房也本地预置房主配置（与 relay 快照到达前 HUD 一致）
   try {
     await connectNet();
-    if (!HAS_NATIVE) {
-      // relay 多房间：建房并带模式/选项/名字，建房者成为房主
-      await net.createRoom({ name: myName, mode: gameMode, lives: gameLives, target: gameMode === 'wave' ? gameTarget : 0, bounce: gameBounce, zmix: gameZmix, config: versusConfig(), pid: myPid });
-    }
+    // relay 多房间：建房并带模式/选项/名字，建房者成为房主
+    await net.createRoom({ name: myName, mode: gameMode, lives: gameLives, target: gameMode === 'wave' ? gameTarget : 0, bounce: gameBounce, zmix: gameZmix, config: versusConfig(), pid: myPid });
     enterGame(true);
   }
   catch (e) { alert('建房失败：' + e.message); show('menu'); hide('hud'); }
@@ -520,56 +407,18 @@ async function startJoin() {
   if (nm && !nm.value) nm.value = myName;
 }
 
-// 搜索房间：原生(APK)走 UDP 广播发现；浏览器走 relay listRooms
+// 搜索房间：浏览器走 relay listRooms
 async function doSearch() {
   const nm = el('player-name-join');
   if (nm && nm.value.trim()) { myName = nm.value.trim().slice(0, 12); saveName(myName); if (net && net.setName) net.setName(myName); }
   try {
     await connectNet();
-    if (HAS_NATIVE) net.scan();          // 原生：UDP 广播发现局域网主机
-    else net.listRooms();                // 浏览器：relay 房间列表
+    net.listRooms();                // relay 房间列表
   } catch (e) {
     alert('连接失败：' + e.message + '\n请确认服务器已开 relay 且两台设备在同一网络。');
   }
 }
 
-// 原生(APK)主机发现回调：把 UDP 广播到的主机渲染成可加入卡片
-const _nativeRooms = [];
-function onNativeRoomFound(host) {
-  if (!host || !host.ip) return;
-  if (_nativeRooms.some((r) => r.ip === host.ip)) return;   // 同主机多次广播去重
-  _nativeRooms.push(host);
-  renderNativeRooms(_nativeRooms);
-}
-function renderNativeRooms(list) {
-  const rl = el('room-list');
-  if (!rl) return;
-  if (!list || list.length === 0) { rl.innerHTML = '<div class="empty">正在搜索房间…</div>'; return; }
-  rl.innerHTML = '';
-  for (const r of list) {
-    const card = document.createElement('div');
-    card.className = 'room-card';
-    card.innerHTML =
-      '<div class="rc-main">' +
-        '<div class="rc-name">' + escapeHtml(r.name || '主机') + '<span class="mode-badge">主机</span></div>' +
-        '<div class="rc-sub">房主地址 ' + escapeHtml(r.ip) + ':' + (r.port || 5000) + '</div>' +
-      '</div>' +
-      '<button class="join-btn" data-ip="' + escapeHtml(r.ip) + '">加入</button>';
-    rl.appendChild(card);
-  }
-  rl.querySelectorAll('.join-btn').forEach((btn) => { btn.onclick = () => joinNative(btn.getAttribute('data-ip')); });
-}
-
-// 原生(APK)客户端加入远端主机：TCP 连接 → 发 joinRoom → 进入等待房
-async function joinNative(ip) {
-  try {
-    await net.connectClient(ip);
-    if (net.stopScan) net.stopScan();
-    net.send({ type: 'joinRoom', roomId: 'r1', name: myName, pid: myPid });
-    hide('join'); closeOverlays(); show('hud'); applyControlVisibility();
-    enterGame(false);
-  } catch (e) { alert('加入失败：' + e.message); }
-}
 
 // 渲染房间列表（服务器下发的 roomList）
 function renderRoomList(list) {
@@ -635,9 +484,8 @@ function applyControlVisibility() {
 }
 
 // ---------------- 游戏循环 ----------------
-// 渲染走 rAF（前台才跑）；模拟逻辑：手机原生主机在本地跑(hostStep)，两电脑 HTML 在 relay(Node 进程)跑，浏览器只渲染。
+// 游戏循环：渲染走 rAF（前台才跑）；浏览器只负责渲染 + 上行输入，权威模拟与广播全在 relay 进程(sim-core.js)。
 let lastInput = null;        // 本渲染帧读到的输入（getInput 每帧只调一次，结果在此共享）
-let hostJumpLatch = false;   // 原生主机权威路径的跳跃边沿锁存（由 simTimer 消费一次）
 
 // 实时帧率 HUD（正式功能，非调试）：用 requestAnimationFrame 的真实回调间隔算 FPS，
 // 不依赖 ?debug，撤调试埋点时此 HUD 保留。每 0.5s 刷新一次显示。
@@ -731,11 +579,10 @@ function startLoop() {
       game.myYaw = (controls && controls.aimYaw != null) ? controls.aimYaw : null;           // 本地瞬时 yaw 喂给相机：零延迟跟手，准星即弹道
       // 每帧喂当前输入状态：predictTick 会按固定 1/60 把它切成带 seq 的指令（本地模拟+上行）
       // 注意：getInput() 会消费跳跃边沿（读一次即清零），所以一帧只准调用一次，
-      // 结果缓存给原生主机的模拟定时器复用——否则两个消费者互相吃边沿 ⇒ 按跳随机没反应。
+      // 每帧只调一次 getInput（跳跃边沿读后即清），结果缓存给本帧其余消费者复用——否则边沿被吃掉 ⇒ 按跳没反应。
       if (controls && controls.getInput) {
         const inp = controls.getInput();
         lastInput = inp;
-        if (inp.jump) hostJumpLatch = true;   // 主机权威路径另行锁存，由 simTimer 消费
         if (game.feedLocalInput) game.feedLocalInput(inp);
       }
     }
@@ -765,33 +612,6 @@ function startLoop() {
   schedule();   // 首帧立即跑
 
 
-  // 仅手机原生(情景1)主机在本地跑权威模拟 + 广播。
-  // 【关键】这里判的是「主机」不是「房主」：relay 情景下房主/接任房主一律不得进来，
-  // 否则会起第二套权威模拟，与 relay 的 sim-core 同时算，状态必然打架。
-  if (isLocalSim()) {
-    const STEP = 1 / 60;
-    let acc = 0;
-    let last = performance.now();
-    let lastBc = 0;
-    simTimer = setInterval(() => {
-      const now = performance.now();
-      const dt = Math.min(0.1, (now - last) / 1000);
-      last = now;
-      acc += dt;
-      while (acc >= STEP) { game.hostStep(STEP); acc -= STEP; }
-      // 复用渲染帧已取的输入（不再二次 getInput，避免争抢跳跃边沿）；跳跃用锁存兑现一次
-      if (lastInput) {
-        game.hostSetInput('host', hostJumpLatch ? { ...lastInput, jump: true } : lastInput);
-        hostJumpLatch = false;
-      }
-      if (now - lastBc > 50) { // 20Hz 广播（原生 TCP 客户端 + WS 浏览器）
-        lastBc = now;
-        const snap = game.hostSnapshot();
-        net.broadcast(snap);
-        if (HAS_NATIVE && net.pushWsState) net.pushWsState(JSON.stringify(snap));
-      }
-    }, 1000 / 60);
-  }
 }
 
 // 停止渲染/模拟循环（软复位用）：置 false 让 rAF 链自然断；清模拟定时器
@@ -835,7 +655,7 @@ function initApp() {
   el('btn-create').onclick = () => openModeSelect();
   el('btn-join').onclick = () => startJoin();
   el('btn-search-rooms').onclick = () => doSearch();
-  el('btn-back').onclick = () => { if (net && net.stopScan) net.stopScan(); if (net && net.close) { try { net.close(); } catch (_) {} } net = null; _nativeRooms.length = 0; closeOverlays(); show('menu'); hide('join'); };
+  el('btn-back').onclick = () => { if (net && net.close) { try { net.close(); } catch (_) {} } net = null; closeOverlays(); show('menu'); hide('join'); };
 
   // 预填玩家名（主机/客户端输入框都默认用已保存的名字）
   const ni = el('player-name-join'); if (ni && !ni.value) ni.value = myName;
@@ -879,20 +699,18 @@ function initApp() {
   restartBtn.textContent = isRoomOwner ? '再来一局' : '催房主再来一局';   // 判「房主权限」而非网络角色：接任房主也要显示"再来一局"
   restartBtn.onclick = () => {
     closeOverlays();   // 结算页若开着设置就点「再来一局」，进游戏/回等待房后一起收掉
-    // 有房主权限者（APK 建房 / 网页建房 / relay 移交来的接任房主）
+    // 有房主权限者（网页建房 / relay 移交来的接任房主）
     if (isRoomOwner) {
       const md = (game && game.state && game.state.mode) || gameMode;
       // 对战：不直接重开，先回等待房——上一局结束时全员 ready 已作废，必须给大家重新配天赋的机会。
       // （直接 startGame 会被"等待配置天赋"门槛顶回来，且那时面板根本不弹 = 死锁，见 sim-core.backToWaiting）
       if (md === 'versus') {
-        if (isLocalSim() && game) game.backToWaiting();
-        else if (net && net.send) net.send({ type: 'backToWaiting' });
+        if (net && net.send) net.send({ type: 'backToWaiting' });
         refreshStartBtn();
         return;
       }
       // 僵尸浪潮：没有 ready 门槛，保持原节奏直接重开
-      if (isLocalSim() && game) game.startGame(gameMode, gameLives, { bounce: gameBounce, zmix: gameZmix, target: gameTarget, config: versusConfig() });
-      else if (net && net.send) net.send(startGameMsg());
+      if (net && net.send) net.send(startGameMsg());
       return;
     }
     // 客户端（非房主）：没有开局权限——改为催房主再来一局（房主收到后弹中央提示，由其手动重开）
@@ -904,10 +722,9 @@ function initApp() {
   };
   el('btn-start-wave').onclick = () => {
     closeOverlays();   // 等待房里开着设置就点「开始」，进游戏后一起收掉
-    // 有房主权限者：本地主机自己开，否则发给权威端(relay)；无权限者仍发 startGame 请求由权威端裁决
+    // 有房主权限者：把开局指令发给权威端(relay) 执行；无权限者仍发 startGame 请求由权威端裁决
     if (isRoomOwner) {
-      if (isLocalSim() && game) game.startGame(gameMode, gameLives, { bounce: gameBounce, zmix: gameZmix, target: gameMode === 'wave' ? gameTarget : 0, config: versusConfig() });
-      else if (net && net.send) net.send(startGameMsg());
+      if (net && net.send) net.send(startGameMsg());
     } else if (net && net.send) {
       net.send({ type: 'startGame', mode: gameMode, lives: gameLives, target: gameMode === 'wave' ? gameTarget : 0, bounce: gameBounce, zmix: gameZmix, config: versusConfig() });
     }
@@ -946,8 +763,7 @@ function initApp() {
     _optHideUntil = Date.now() + 1500;
     const tp = el('talent-panel'); if (tp) tp.classList.add('hidden');
     _tpLastSig = '';   // 强制下帧重算签名
-    if (isLocalSim()) { if (game && game.hostSetReady) game.hostSetReady('host', true); }
-    else if (net && net.send) net.send({ type: 'ready', ready: true });
+    if (net && net.send) net.send({ type: 'ready', ready: true });
     // 刚 exitPointerLock 不久，浏览器处于 ~1.25s 锁定冷却期 → lockPointer 会自动排队补锁（不再抛 reject）
     if (game && game.state && game.state.status === 'playing') {
       lockPointer(document.getElementById('game-canvas'));
@@ -1118,11 +934,9 @@ function codeToLabel(code) {
 // 注意语义：这是「自己走的时候说一声」，不是清退别人 ——
 //   · 切后台 / 锁屏进 bfcache（persisted=true）一律跳过，切回来还能接着玩；
 //   · relay 的心跳超时原样保留，不缩短、不额外踢人。
-// APK 壳内（HAS_NATIVE）不处理：那边的连接清理由原生层负责，重复断开反而会误伤本地主机。
 let _leftOnUnload = false;
 function leaveOnUnload(e) {
-  if (HAS_NATIVE) return;
-  if (e && e.persisted) return;
+  if (e && e.persisted) return;   // 切后台/锁屏进 bfcache 跳过，切回来还能接着玩
   if (_leftOnUnload) return;   // pagehide 与 beforeunload 可能都触发，只执行一次
   _leftOnUnload = true;
   try { if (net && net.close) net.close(); } catch (_) {}
@@ -1130,4 +944,4 @@ function leaveOnUnload(e) {
 window.addEventListener('pagehide', leaveOnUnload);
 window.addEventListener('beforeunload', leaveOnUnload);
 
-console.log('[Game4U] 就绪。模式:', HAS_CAP ? 'Capacitor(真机)' : '桌面/HTML', '| 控制:', CTRL_MODE);
+console.log('[Game4U] 就绪。模式: 桌面/HTML（中心化 relay 客户端）', '| 控制:', CTRL_MODE);

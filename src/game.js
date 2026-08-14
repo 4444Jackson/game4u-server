@@ -250,7 +250,7 @@ export class Game {
 
   // ---------- 建模资源（MOD 化） ----------
   // 实体外观完全由 public/assets/entities/mod.json + 贴图决定。
-  // fetch 失败（如离线 APK 缺资源）时回退到内置 DEFAULT_MOD，保证总能渲染。
+  // fetch 失败（如离线或资源缺失）时回退到内置 DEFAULT_MOD，保证总能渲染。
   async _loadEntityMod() {
     try {
       const res = await fetch(this.assetBase + 'mod.json');
@@ -389,87 +389,7 @@ export class Game {
     p.radius = PLAYER_OBS_R * st.scale;
   }
 
-  hostAddPlayer(id, name) {
-    const color = PALETTE[Object.keys(this.state.players).length % PALETTE.length];
-    const p = this._mkPlayer(id, name, color);
-    // 晚加入（镜像 relay.joinRoom 语义）：房间进行中 → 以「死亡→复活倒计时」进入，
-    // 给一次天赋配置机会，而非满血直接参战；命数与在场者一致（0 = 无限命）
-    if (this.state.status === 'playing') {
-      p.alive = false;
-      p.respawnCd = RESPAWN_TIME;
-      p.lives = this.state.livesMax;
-    }
-    this.state.players[id] = p;
-  }
 
-  // 离线（镜像 sim-core.setOffline）：不删对象，只从图上移除存在；命数/杀数/天赋全保留
-  hostSetOffline(id) {
-    const p = this.state.players[id];
-    if (!p || p.state === 0) return;
-    p.state = 0;
-    p.alive = false;
-    p.respawnCd = 0;
-    p.ready = 0;   // 离线即作废"配好了"：回来时面板自动重弹
-    p.vy = 0; p.grounded = true; p.jumpBuf = 0; p.coyoteT = 0; p.fireCd = 0;
-    p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
-    p.cmdQueue = []; p.lastAckSeq = 0; p.useCmdStream = false;
-  }
-
-  // 上线/重连（镜像 sim-core.setOnline）：当刷进来，随机撒点满血入场；已 out 者只回旁观
-  hostSetOnline(id) {
-    const p = this.state.players[id];
-    if (!p) return;
-    p.state = 1;
-    p.cmdQueue = []; p.lastAckSeq = 0; p.useCmdStream = false;
-    p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
-    p.respawnCd = 0;
-    const st = computeStats(this.config, p.talent);
-    p.stats = st;
-    p.radius = PLAYER_OBS_R * st.scale;
-    if (p.out) { p.alive = false; return; }
-    p.maxHp = this.config.COMBAT.baseHP;
-    p.hp = p.maxHp; p.alive = true;
-    p.y = 0; p.vy = 0; p.grounded = true; p.jumpBuf = 0; p.coyoteT = 0; p.fireCd = 0;
-    p.x = (Math.random() * 2 - 1) * 10;
-    p.z = (Math.random() * 2 - 1) * 10;
-    p.aim = 0;
-  }
-
-  // 真删：仅用于销毁/清空房间（正常掉线走 hostSetOffline，否则对战人数分母塌陷）
-  hostPurgePlayer(id) {
-    delete this.state.players[id];
-  }
-
-  // ---- 房间级：pid 席位认领 / ready 门槛（情景1 手机主机；与 relay.cjs 的 room.pids/room.ready 同构）----
-  // pid = 客户端 localStorage 里的持久身份，重连时凭它认领原席位（命数/杀数/天赋原样接回）
-  hostClaimSeat(pid) {
-    if (!pid || !this._pids) return null;
-    const cid = this._pids.get(pid);
-    const p = cid ? this.state.players[cid] : null;
-    // 接管(takeover)：pid 命中即认领该席位，不论它当前是否在线。
-    // 不再要求 state===0——旧连接可能还活着（刷新/同 pid 第二标签页/抖动重连快于旧 socket 关闭），
-    // 此时若"当新人"会开第二个席位 → "两个自己"的 bug。命中即接管那个 cid，旧连接由上层标 stale 防重复 detach。
-    return p ? cid : null;
-  }
-  hostBindPid(pid, cid) {
-    if (!this._pids) this._pids = new Map();
-    if (pid) this._pids.set(pid, cid);
-  }
-  hostRoster() {
-    return Object.values(this.state.players).filter((p) => p.state === 1);
-  }
-  // ready 标志位写在玩家对象上（镜像 sim-core.setReady）：不再另维护一份 Set，
-  // 免得"房间层名单"与"玩家标志位"两处口径打架
-  hostSetReady(cid, v) {
-    const p = this.state.players[cid];
-    if (p) p.ready = (v === false) ? 0 : 1;
-  }
-  // 对战开局门槛：在线 ≥2 人且全员 ready。wave 不设门槛（单人开荒合法）
-  hostVersusCanStart() {
-    const r = this.hostRoster();
-    if (r.length < 2) return false;
-    return r.every((p) => p.ready === 1);
-  }
 
   // 房主点击「开始游戏」：mode='wave'(僵尸浪潮) | 'versus'(对战，无僵尸)
   // lives：对战强制 ≥1；僵尸浪潮允许 0 = 无限命（死亡后重生）。target：0 = 无限击杀（无尽生存）
@@ -512,7 +432,7 @@ export class Game {
       p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
       p.cmdQueue = []; p.lastAckSeq = 0;
       p.fireCd = 0; p.kills = 0;
-      // 离线者：保持 state=0 不入场（命数已按新局发好），回来时由 hostSetOnline 刷进来
+      // 离线者：保持 state=0 不入场（命数已按新局发好），回来时由服务器(relay)重新刷进
       if (p.state === 0) { p.alive = false; continue; }
       p.alive = true;
       p.y = 0; p.vy = 0; p.grounded = true;
@@ -525,33 +445,6 @@ export class Game {
     s.spawnCd = 0.6; s.status = 'playing';
   }
 
-  // 结算后「再来一局」→ 回空白等待房（镜像 sim-core.backToWaiting，复用建房入口）。
-  // 设计：房主不变、房间配置不变、原班玩家留房，但世界彻底重置为崭新空白局。
-  // 实现：抽走配置+花名册 → `this.state = this._emptyState()` 一刀切 → 填回配置与花名册。
-  backToWaiting() {
-    const s = this.state;
-    const kept = {
-      mode: s.mode, livesMax: s.livesMax, bounce: s.bounce,
-      zmix: s.zmix, target: s.target, config: this.config,
-    };
-    const roster = [];
-    for (const id in s.players) {
-      const p = s.players[id];
-      roster.push({ id, name: p.name, color: p.color, state: p.state, talent: p.talent });
-    }
-    this.state = this._emptyState();
-    const ns = this.state;
-    ns.mode = kept.mode; ns.livesMax = kept.livesMax; ns.bounce = kept.bounce;
-    ns.zmix = kept.zmix; ns.target = kept.target; this.config = kept.config;
-    for (const r of roster) {
-      const p = this._mkPlayer(r.id, r.name, r.color);
-      p.state = r.state;
-      p.talent = r.talent;                  // 天赋沿用上局（面板仍会弹，可改配）
-      if (r.state === 0) p.alive = false;   // 离线席位：保持不入场
-      ns.players[r.id] = p;
-    }
-    this._rebuildObstacles(ns.obstacles);   // 本地权威：障碍网格同步清空（等待房为空白地形）
-  }
 
   // 击杀一名玩家（镜像 sim-core）：无限命(房间 livesMax===0)只进重生倒计时不扣命；否则扣 1 命，
   // 仍有命则重生，命数耗尽 → out=true（永久出局）。
@@ -569,237 +462,6 @@ export class Game {
     }
   }
 
-  hostSetInput(id, input) {
-    const p = this.state.players[id];
-    if (p) p.input = input;
-  }
-
-  // 主机：接收远端客户端的指令流（与 sim-core.queueCmds 完全同构）
-  hostQueueCmds(id, cmds) {
-    const p = this.state.players[id];
-    if (!p || !Array.isArray(cmds)) return;
-    if (!p.cmdQueue) { p.cmdQueue = []; p.lastAckSeq = 0; }
-    for (const c of cmds) {
-      const seq = c && c.seq | 0;
-      if (seq <= p.lastAckSeq) continue;
-      const tail = p.cmdQueue.length ? p.cmdQueue[p.cmdQueue.length - 1].seq : p.lastAckSeq;
-      if (seq <= tail) continue;
-      if (p.cmdQueue.length >= 120) p.cmdQueue.shift();
-      p.cmdQueue.push({
-        seq,
-        mx: +c.mx || 0, mz: +c.mz || 0,
-        ax: +c.ax || 0, az: +c.az || 0,
-        pitch: +c.pitch || 0,
-        fire: !!c.fire, jump: !!c.jump,
-      });
-    }
-    p.useCmdStream = true;
-  }
-
-  // ---------- 主机：模拟一帧 ----------
-  hostStep(dt) {
-    const s = this.state;
-    const obs = s.obstacles;
-    const FIRE_INTERVAL = 1 / this.config.COMBAT.fireRate;
-    const JUMP_V = this.config.COMBAT.jumpForce;
-
-    // 玩家移动 / 射击（waiting 与 playing 都执行：开局前双方可自由走位、预瞄）
-    for (const id in s.players) {
-      const p = s.players[id];
-      if (p.state === 0) continue;   // 离线：不在图上，完全不模拟（回来时 hostSetOnline 重新撒点）
-      if (!p.alive) {
-        // 死亡期间：确认掉积压指令（与 sim-core 同构，防复活被陈旧指令拖着跑）
-        if (p.cmdQueue && p.cmdQueue.length) {
-          p.lastAckSeq = p.cmdQueue[p.cmdQueue.length - 1].seq;
-          p.cmdQueue.length = 0;
-        }
-        continue;
-      }
-      if (p.useCmdStream) {
-        // 指令流远端玩家：逐条消费（每 tick 最多 3 条追积压；队列空不动）——与 sim-core 同构
-        let n = 0;
-        while (p.cmdQueue && p.cmdQueue.length && n < 3) {
-          const cmd = p.cmdQueue.shift();
-          p.input = cmd;
-          if (cmd.jump) p.jumpBuf = JUMP_BUFFER;
-          this._hostStepPlayerOnce(p, cmd, 1 / 60, obs, FIRE_INTERVAL, JUMP_V);
-          p.lastAckSeq = cmd.seq;
-          n++;
-        }
-        continue;
-      }
-      if (p.input && p.input.jump) p.jumpBuf = JUMP_BUFFER;   // 状态式（主机自己/旧客户端）：跳跃武装缓冲
-      this._hostStepPlayerOnce(p, p.input, dt, obs, FIRE_INTERVAL, JUMP_V);
-    }
-
-    this._hostStepWorld(dt);
-  }
-
-  // 主机：单玩家一步物理（指令流与状态式共用；与 sim-core._stepPlayerOnce 同构）
-  _hostStepPlayerOnce(p, inp, dt, obs, FIRE_INTERVAL, JUMP_V) {
-    {
-      let mx = inp.mx, mz = inp.mz;
-      const ml = Math.hypot(mx, mz);
-      if (ml > 1) { mx /= ml; mz /= ml; }
-      // 移动方向直接取输入瞄准向量(ax/az)，与 sim-core/客户端预测同口径（避免用陈旧 1 步的 p.aim 导致转向发散）
-      const aimX = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3) ? inp.ax : Math.sin(p.aim);
-      const aimZ = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3) ? inp.az : Math.cos(p.aim);
-      const sa = aimX, ca = aimZ;
-      const fwd = -mz, strafe = mx;
-      const dx = fwd * sa - strafe * ca;
-      const dz = fwd * ca + strafe * sa;
-      const spd = p.stats ? p.stats.moveSpeed : this.config.COMBAT.baseMoveSpeed;
-      const nx = clamp(p.x + dx * spd * dt, -MAP + 1, MAP - 1);
-      const nz = clamp(p.z + dz * spd * dt, -MAP + 1, MAP - 1);
-      // 体积/移动碰撞：圆柱（半径=基准×受击面积缩放，旋转无关、贴墙顺滑）；伤害判定另用 obbOverlap 严格方块
-      const mv = moveCircle(obs, p.x, p.z, nx, nz, p.radius || PLAYER_OBS_R, p.y);
-      p.x = mv.x; p.z = mv.z;
-      const sup = topAt(obs, p.x, p.z, SUPPORT_R);
-      // 跳跃缓冲 + 土狼时间（与 sim-core.step 同口径）
-      if (p.grounded) p.coyoteT = COYOTE;
-      else if (p.coyoteT > 0) p.coyoteT -= dt;
-      if (p.jumpBuf > 0 && (p.grounded || p.coyoteT > 0)) {
-        p.vy = JUMP_V; p.grounded = false; p.jumpBuf = 0; p.coyoteT = 0;
-      } else if (p.jumpBuf > 0) {
-        p.jumpBuf -= dt;
-      }
-      if (p.grounded && p.y > sup + 0.01) p.grounded = false;   // 走出箱顶边缘 → 下落
-      if (!p.grounded) {
-        p.vy -= GRAVITY * dt;
-        p.y += p.vy * dt;
-        if (p.y <= sup && p.vy <= 0) { p.y = sup; p.vy = 0; p.grounded = true; }
-      } else {
-        p.y = sup;
-      }
-      // 落地/移动兜底去穿透（与 sim-core 同逻辑）：落点在障碍里则顶出，杜绝伪卡死
-      depenetratePlayer(obs, p);
-      if (Math.hypot(inp.ax, inp.az) > 0.15) p.aim = Math.atan2(inp.ax, inp.az);
-      p.fireCd -= dt;
-      if (inp.fire && p.fireCd <= 0) {
-        p.fireCd = FIRE_INTERVAL;
-        this._spawnBullet(p);
-      }
-    }
-  }
-
-  // 主机：世界模拟（子弹/僵尸/重生/胜负）——与玩家步进解耦，每 tick 恒跑一次
-  _hostStepWorld(dt) {
-    const s = this.state;
-    const obs = s.obstacles;
-
-    // 子弹（含飞行高度 y 与撞墙/障碍反弹/消失）
-    for (let i = s.bullets.length - 1; i >= 0; i--) {
-      const b = s.bullets[i];
-      const px = b.x, pz = b.z;
-      b.x += b.vx * dt; b.z += b.vz * dt; b.y += (b.vy || 0) * dt; b.life -= dt;
-      const byaw = Math.atan2(b.vx, b.vz);   // 子弹朝向（沿飞行方向）
-      let hit = false;
-      if (s.mode === 'versus' && s.status === 'playing') {
-        // 对战：子弹命中其他存活玩家（OBB 精确接触 + 高度够得着，缩放同步）
-        for (const id in s.players) {
-          const p = s.players[id];
-          if (!p.alive || p.id === b.owner) continue;
-          const pr = p.radius || PLAYER_OBS_R;
-          if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, p.x, p.z, pr, pr, p.aim) &&
-              b.y > p.y - 0.2 && b.y < p.y + VISUAL_H * (p.stats ? p.stats.scale : 1) + 0.5) {
-            // 最终伤害 = max(攻击者单发伤害(含攻击天赋) - 受害者防御加成, 1)（与 sim-core 同公式）
-            const dmg = Math.max((b.dmg || this.config.COMBAT.baseDamage) - (p.stats ? p.stats.defense : 0), 1);
-            p.hp -= dmg; hit = true;
-            if (p.hp <= 0) {
-              p.hp = 0;
-              if (b.owner && s.players[b.owner]) {
-                s.players[b.owner].kills += 1;
-                s.events.push({ id: s.nextEventId++, killer: b.owner, victim: p.id, t: s.matchTime });
-                if (s.events.length > 12) s.events.shift();
-              }
-              this._killPlayer(p);
-            }
-            break;
-          }
-        }
-      } else {
-        // 僵尸浪潮：子弹命中僵尸（飞行僵尸按其飞行高度判定）
-        for (const z of s.zombies) {
-          const zy = z.y || 0;
-          if (obbOverlap(b.x, b.z, BULLET_RADIUS, BULLET_RADIUS, byaw, z.x, z.z, ZOMBIE_RADIUS, ZOMBIE_RADIUS, 0) &&
-              b.y > zy - 0.3 && b.y < zy + 2.0) {
-            z.hp -= 1; hit = true;
-            if (z.hp <= 0) {
-              z.dead = true; s.score += 1;
-              if (b.owner && s.players[b.owner]) s.players[b.owner].kills += 1;
-            }
-            break;
-          }
-        }
-      }
-      // 撞围墙/障碍：房主开了反弹则镜面反弹，否则消失
-      if (!hit && bulletWorld(obs, b, px, pz, s.bounce)) hit = true;
-      // 落地：低头打地面 → 消失（开反弹则向上弹起，与墙面镜面反弹一致）
-      if (!hit && b.y <= 0) {
-        if (s.bounce) { b.y = -b.y; b.vy = -(b.vy || 0); }
-        else hit = true;
-      }
-      if (hit || b.life <= 0) s.bullets.splice(i, 1);
-    }
-    s.zombies = s.zombies.filter((z) => !z.dead);
-
-    // 仅进入游戏(playing)后才生成僵尸并结算胜负；waiting 阶段只跑上面的移动/射击
-    if (s.status !== 'playing') return;
-
-    // 对战模式：累计计时（时间上限判定用）
-    if (s.mode === 'versus') s.matchTime += dt;
-
-    // 僵尸 AI（仅僵尸浪潮模式）：三类行为在 map-core.stepZombie 中实现
-    if (s.mode === 'wave') {
-      const ctx = { obs, grid: s.grid, players: s.players };
-      for (const z of s.zombies) {
-        const victim = stepZombie(z, dt, ctx);
-        if (victim) {
-          victim.hp -= ZOMBIE_DMG;
-          if (victim.hp <= 0) { victim.hp = 0; this._killPlayer(victim); }
-        }
-      }
-
-      // 生成
-      s.spawnCd -= dt;
-      if (s.spawnCd <= 0 && s.zombies.length < MAX_ZOMBIES) {
-        s.spawnCd = SPAWN_INTERVAL;
-        this._spawnZombie();
-      }
-    }
-
-    // 复活倒计时：死亡且处于重生倒计时中即重生（对战有限命 / 僵尸浪潮无限命都会触发）
-    for (const id in s.players) {
-      const p = s.players[id];
-      if (p.state === 0 || p.out) continue;   // 离线者不在图上、出局者不再复活
-      if (!p.alive && p.respawnCd > 0) {
-        p.respawnCd -= dt;
-        if (p.respawnCd <= 0) {
-          // 复活时按「当前天赋分配」重算实战数值（重装上阵：死亡等复活期间可重新调配天赋）
-          const st = computeStats(this.config, p.talent);
-          p.stats = st;
-          p.radius = PLAYER_OBS_R * st.scale;
-          p.hp = p.maxHp; p.alive = true;
-          p.y = 0; p.vy = 0; p.grounded = true;
-          p.jumpBuf = 0; p.coyoteT = 0;
-          p.x = (Math.random() * 2 - 1) * 10;
-          p.z = (Math.random() * 2 - 1) * 10;
-          p.aim = 0; p.fireCd = 0;
-        }
-      }
-    }
-
-    // 胜负
-    if (s.mode === 'versus') {
-      this._versusWin();
-    } else {
-      // 僵尸浪潮结束条件（无任何人数下限，单人开荒同样成立）：
-      //   胜 = 击杀达标；负 = 在线的人全部 out。离线者既不计入在场、也不触发判负。
-      const roster = Object.values(s.players).filter((p) => p.state === 1);
-      if (s.target > 0 && s.score >= s.target) s.status = 'win';   // 0 = 无限，不靠击杀获胜
-      else if (roster.length > 0 && roster.every((p) => p.out)) s.status = 'lose';
-    }
-  }
 
   // 对战结束条件（与 sim-core._versusWin 完全同构）：只看「命数」和「时间」。
   //   A. 命数淘汰（livesMax>0）：未 out 者 ≤1 → 结束；B. 限时到点 → 结束
@@ -852,42 +514,6 @@ export class Game {
     });
   }
 
-  hostSnapshot() {
-    const s = this.state;
-    // 本机主机不走 applySnapshot，HUD 直接读 this.state → canStart 必须回写进 state，
-    // 否则等待房「开始」按钮读到 undefined 恒被置灰，房主永远开不了对战。
-    s.canStart = (s.mode === 'versus') ? this.hostVersusCanStart() : true;
-    return {
-      type: 'state',
-      st: Date.now(),   // 主机发送时刻：客户端以此为插值时间轴（与 relay 路径同构，滤到达抖动）
-      mode: s.mode, livesMax: s.livesMax, winner: s.winner || null,
-      bounce: s.bounce,
-      config: this.config,         // 房主配置（timeLimit 等，客户端 HUD/预测同口径用）
-      matchTime: s.matchTime || 0,
-      events: (s.events || []).slice(),   // 击杀滚动日志
-      map: s.obstacles,   // 静态地形（客户端按内容变化重建网格模型）。APK 主机兼容：直连 LAN 的浏览器客户端仍从每帧快照取地形；relay 路径已改走独立 static、快照不含 map（此处为兼容例外）
-      // 离线玩家只发精简包（st:0，与 sim-core.snapshot 同构）：不在图上，位置/运动学一概不发，
-      // 客户端据此隐藏模型；名字/命数/杀数保留供战绩板与玩家列表显示"离线"席位
-      // ready 随每个玩家下发（与 sim-core.snapshot 同构）：客户端据此弹/收天赋面板、列未配好名单
-      players: Object.values(s.players).map((p) => (p.state === 0 ? {
-        id: p.id, name: p.name, color: p.color, on: 0,
-        lives: p.lives, kills: p.kills || 0, out: !!p.out, alive: false, ready: p.ready | 0,
-      } : {
-        on: 1, out: !!p.out, ready: p.ready | 0,
-        id: p.id, name: p.name, x: p.x, z: p.z, y: p.y, hp: p.hp, maxHp: p.maxHp,
-        ack: p.lastAckSeq || 0,   // 指令流：已模拟到的最后指令序号（与 sim-core.snapshot 同构）
-        vy: p.vy || 0, gr: p.grounded ? 1 : 0, jb: p.jumpBuf || 0, ct: p.coyoteT || 0, fcd: p.fireCd || 0,
-        aim: p.aim, alive: p.alive, color: p.color, kills: p.kills || 0,
-        lives: p.lives, respawnCd: p.respawnCd || 0,
-        scale: p.stats ? p.stats.scale : 1,
-        talent: p.talent
-      })),
-      zombies: s.zombies.map((z) => ({ id: z.id, k: z.k || 'walker', x: z.x, z: z.z, y: z.y || 0, hp: z.hp })),
-      bullets: s.bullets.map((b) => ({ id: b.id, x: b.x, z: b.z, y: b.y || 0 })),
-      canStart: s.canStart,   // 房间级状态（与 relay 广播同构）：客户端据此置灰"开始"按钮
-      score: s.score, target: s.target, status: s.status
-    };
-  }
 
   // 静态数据一次性下发：仅建房/加入/接管/开局时由 relay 各发一次。
   // 仅在此重建地形 + 存 config，不进每帧 applySnapshot 热路径（省 JSON.stringify + 省带宽）。
@@ -896,7 +522,7 @@ export class Game {
     const s = this.state;
     if (snap.config) { this.config = snap.config; s.config = snap.config; }
     // 地形允许为空数组：回等待房/未开局时 map=[]，必须照样清掉旧障碍方块（不能因 length===0 跳过）。
-    // 否则 backToWaiting 把权威地形重置成空白，客户端却永远留着上局的障碍物。
+    // 否则权威端(relay)把地形重置成空白，客户端却永远留着上局的障碍物。
     if (snap.map && Array.isArray(snap.map)) {
       const sig = JSON.stringify(snap.map);
       if (sig !== this._mapSig) {
