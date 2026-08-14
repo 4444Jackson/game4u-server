@@ -496,11 +496,12 @@ function ensureFpsHud() {
   _fpsEl = document.createElement('div');
   _fpsEl.id = 'fps-hud';
   _fpsEl.textContent = '-- FPS';
-  _fpsEl.style.cssText = 'position:fixed;top:max(14px,env(safe-area-inset-top));left:64px;z-index:55;'
-    + 'font:600 12px/1.3 ui-monospace,Menlo,Consolas,monospace;'
+  _fpsEl.style.cssText = 'font:600 12px/1.3 ui-monospace,Menlo,Consolas,monospace;'
     + 'color:#7CFFB2;background:rgba(0,0,0,.42);padding:2px 7px;border-radius:7px;'
     + 'pointer-events:none;-webkit-user-select:none;user-select:none;letter-spacing:.3px;';
-  document.body.appendChild(_fpsEl);
+  // 挂进居中的 #hud-top：作为行首子元素，天然依附在击杀数左侧（避免贴屏幕边缘被甩远）
+  const _htop = document.getElementById('hud-top');
+  if (_htop) _htop.prepend(_fpsEl); else document.body.appendChild(_fpsEl);
 }
 
 // 网络延迟 HUD（参考王者「460」式指示器）：显示手机↔relay 的实时往返延迟(RTT)，
@@ -512,11 +513,12 @@ function ensurePingHud() {
   _pingEl = document.createElement('div');
   _pingEl.id = 'ping-hud';
   _pingEl.textContent = '📶 --';
-  _pingEl.style.cssText = 'position:fixed;top:6px;right:64px;z-index:55;'
-    + 'font:600 12px/1.3 ui-monospace,Menlo,Consolas,monospace;'
+  _pingEl.style.cssText = 'font:600 12px/1.3 ui-monospace,Menlo,Consolas,monospace;'
     + 'color:#9aa0a6;background:rgba(0,0,0,.42);padding:2px 7px;border-radius:7px;'
     + 'pointer-events:none;-webkit-user-select:none;user-select:none;letter-spacing:.3px;';
-  document.body.appendChild(_pingEl);
+  // 挂进居中的 #hud-top：作为行尾子元素，天然依附在击杀数右侧（避免贴屏幕边缘被甩远）
+  const _htop = document.getElementById('hud-top');
+  if (_htop) _htop.appendChild(_pingEl); else document.body.appendChild(_pingEl);
 }
 function updatePingHud(rtt) {
   if (!_pingEl) return;
