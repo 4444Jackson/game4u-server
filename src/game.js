@@ -754,7 +754,11 @@ export class Game {
     const nz = clamp(pr.z + dz * spd * dt, -MAP + 1, MAP - 1);
     const mv = moveCircle(obs, pr.x, pr.z, nx, nz, myR, pr.y);
     pr.x = mv.x; pr.z = mv.z;
-    const sup = topAt(obs, pr.x, pr.z, SUPPORT_R);
+    // 支撑判定半径必须与服务器同口径（随碰撞半径缩放，恒<半径）：
+    // 否则缩小体型者贴墙时，客户端用固定 SUPPORT_R=0.25 误判"站在顶面"瞬移上顶(y=1.5)，
+    // 而服务器用 min(0.25, r*0.5)=0.06 判定在地面(y=0) → 预测与权威每帧不一致 → 侧边中等高度处闪烁。
+    //（用户实测：缩放到最小、贴近障碍时必现；正常体型两侧一致故不闪。）这是客户端预测唯一的竖直支撑差异点。
+    const sup = topAt(obs, pr.x, pr.z, Math.min(SUPPORT_R, myR * 0.5));
     // 跳跃缓冲 + 土狼时间（与服务器 step 完全同口径 → 起跳时机一致，不发散）
     if (pr.grounded) pr.coyoteT = COYOTE;
     else if (pr.coyoteT > 0) pr.coyoteT -= dt;
