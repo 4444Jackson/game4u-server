@@ -1,9 +1,8 @@
 // sim-core.js — 纯模拟核心（权威游戏逻辑，无 THREE / 无渲染依赖）
 // 同一份逻辑在 Node 端由 relay.cjs 跑（权威服务器），浏览器端不引用本文件。
-// ⚠️ 与 src/game.js 的 hostStep 逻辑必须保持同步：手机原生(情景1)走 game.js 的 hostStep，
-//    两电脑 HTML(情景2) 走本文件的 Sim。修改模拟规则时两处都要改。
-// 地形/碰撞/视线/寻路/僵尸AI 已抽到 map-core.js 共享，两侧 import 同一份，天然一致。
-// 配置 / 天赋数学来自 gameConfig.js（单一来源），两侧 import 同一份，杜绝数值漂移。
+// 由 relay.cjs 作为唯一权威服务器运行；浏览器端不引用本文件。
+// 地形/碰撞等共享逻辑在 map-core.js、配置/天赋数学在 gameConfig.js，均为权威单一来源，
+// 由 relay 与浏览器客户端各自 import——不存在"镜像 / 手工同步"另一份模拟。
 
 import {
   MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,

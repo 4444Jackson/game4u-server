@@ -1,7 +1,6 @@
-// game.js — Three.js 渲染 + 游戏模拟（主机权威 / 客户端渲染）
+// game.js — 浏览器客户端：Three.js 渲染 + 本地输入预测（权威模拟只在 relay 的 sim-core.js，本文件不跑权威逻辑）
 import * as THREE from 'three';
-// 共享模拟核心：地形/碰撞/视线/寻路/僵尸AI 全部 import 同一份 map-core.js，
-// 与 sim-core.js（relay 权威）天然一致，杜绝两条路径手工镜像出错。
+// 地形/碰撞/视线/寻路/僵尸AI 等共享逻辑来自 map-core.js，与权威端(relay) import 同一份，无需手工镜像。
 import {
   MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,
   bulletWorld, pickZombieKind, ZSTAT, stepZombie
@@ -357,16 +356,16 @@ export class Game {
     return {
       id, name, color, x: (Math.random() * 2 - 1) * 10, z: (Math.random() * 2 - 1) * 10,
       y: 0, vy: 0, grounded: true,
-      jumpBuf: 0, coyoteT: 0,   // 跳跃缓冲 / 土狼时间（主机镜像 sim-core）
+      jumpBuf: 0, coyoteT: 0,   // 跳跃缓冲 / 土狼时间（客户端本地状态，权威值以服务器快照为准）
       hp: 100, maxHp: 100, aim: 0, alive: true,
-      // 连接态(state) 与 生命态(out/alive) 正交（镜像 sim-core，两条权威路径必须一致）：
-      //   state: 1=在线（默认初值） 0=离线（WS 断/主动退出，不区分、不超时、随时可回）
+      // 连接态(state) 与 生命态(out/alive) 正交：
+      //   state: 1=在线 0=离线（WS 断/主动退出，不区分、不超时、随时可回）
       //   out  : true=本局命数耗尽永久出局（唯一参与"本局是否结束"的标记）
       state: 1, out: false,
-      // ready: 天赋"配好没配好"的唯一标志位（镜像 sim-core）。0=没配/要重配，1=配好了。
+      // ready: 天赋"配好没配好"的唯一标志位。0=没配/要重配，1=配好了。
       //   置 0：离线 / 阵亡 / 开局 / 回等待房；置 1：点「✔ 配好了」
       ready: 0,
-      lives: 1, deaths: 0, respawnCd: 0,   // 对战模式：剩余命数 / 已死次数 / 死亡重生倒计时
+      lives: 1, respawnCd: 0,   // 对战模式：剩余命数 / 死亡重生倒计时
       input: { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false }, fireCd: 0, kills: 0,
       talent: { atk: 0, def: 0, spd: 0, size: 0, lives: 0 },  // 天赋等级（开局前由玩家分配）
       stats: null,   // 派生实战数值（startGame 时按 config+talent 计算）
@@ -424,11 +423,10 @@ export class Game {
       p.radius = PLAYER_OBS_R * st.scale;
       p.maxHp = this.config.COMBAT.baseHP;
       p.hp = p.maxHp;
-      // 命数 = 基础 + 天赋命数加成（deaths=0）；基础 0 = 无限命（保持 0 标记，天赋加成不参与）
-      p.deaths = 0;   // 新一局：已死次数清零
+      // 命数 = 基础 + 天赋命数加成；基础 0 = 无限命（保持 0 标记，天赋加成不参与）
       p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
       p.out = false;            // 新一局：所有人清空出局标记
-      p.ready = 0;              // 新一局：标志位全清（镜像 sim-core.startGame）
+      p.ready = 0;              // 新一局：标志位全清
       p.respawnCd = 0;
       p.input = { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false };
       p.cmdQueue = []; p.lastAckSeq = 0;
@@ -447,30 +445,24 @@ export class Game {
   }
 
 
-  // 击杀一名玩家（镜像 sim-core）：无限命(房间 livesMax===0)只进重生倒计时不扣命；否则扣 1 命，
-  // 仍有命则重生，命数耗尽 → out=true（永久出局）。
-  // ⚠️ 无限命判定看 livesMax 而非 p.lives<=0——后者与"有限命刚好扣到 0"二义，会让出局者反复重生。
+  // 历史遗留：本方法在原生主机路径剥离后已无调用方（死亡结算只走 relay 的 sim-core.js）。
+  // 客户端不跑权威击杀/命数逻辑，此处仅保留作本地状态占位，不镜像服务器。
   _killPlayer(p) {
     p.alive = false;
-    p.ready = 0;   // 阵亡即作废"配好了"：复活窗口内面板自动弹出（镜像 sim-core）
+    p.ready = 0;   // 阵亡即作废"配好了"：复活窗口内面板自动弹出
     if (this.state.livesMax === 0) {
       p.lives = 0;
       p.respawnCd = RESPAWN_TIME;     // 无限命：死亡后重生，不扣命，永不 out
     } else {
-      // 诚实模型（镜像 sim-core）：remaining = 基础命 + 天赋命 − 已死次数(deaths)；deaths 只增不减
-      const st = computeStats(this.config, p.talent);
-      p.deaths = (p.deaths || 0) + 1;
-      const remaining = this.state.livesMax + st.extraLives - p.deaths;
-      p.lives = Math.max(0, remaining);
-      if (remaining > 0) p.respawnCd = RESPAWN_TIME;
-      else { p.out = true; p.respawnCd = 0; }   // 命数耗尽：永久出局
+      p.lives -= 1;
+      if (p.lives > 0) p.respawnCd = RESPAWN_TIME;
+      else { p.lives = 0; p.out = true; p.respawnCd = 0; }
     }
   }
 
 
-  // 对战结束条件（与 sim-core._versusWin 完全同构）：只看「命数」和「时间」。
-  //   A. 命数淘汰（livesMax>0）：未 out 者 ≤1 → 结束；B. 限时到点 → 结束
-  // 铁律：不加「人数>=2」前置；离线(state=0) 不等于出局，熄屏的人 out 仍为 false，照样占分母。
+  // 历史遗留：原生主机路径剥离后已无调用方（对战结束判定只走 relay 的 sim-core.js._versusWin）。
+  // 客户端不跑权威判定，此处保留作本地状态占位，不镜像服务器。
   _versusWin() {
     const s = this.state;
     const players = Object.values(s.players);
@@ -485,7 +477,7 @@ export class Game {
   }
 
   _spawnBullet(p) {
-    // 视角即弹道：速度向量 = 视线单位向量(yaw+pitch) × 子弹速度，恒速直飞（无重力/加速度）
+    // 历史遗留：原生主机路径剥离后已无调用方（子弹生成只走 relay 的 sim-core.js._spawnBullet）。
     const a = p.aim;
     const LIM = Math.PI / 2 - 0.05;   // 与相机 pitch 限位一致
     const pitch = Math.max(-LIM, Math.min(LIM, (p.input && p.input.pitch) || 0));
@@ -503,6 +495,7 @@ export class Game {
     });
   }
 
+  // 历史遗留：原生主机路径剥离后已无调用方（僵尸生成只走 relay 的 sim-core.js._spawnZombie）。
   _spawnZombie() {
     const S = MAP - 1;
     const edge = Math.floor(Math.random() * 4);

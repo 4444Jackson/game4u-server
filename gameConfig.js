@@ -1,6 +1,6 @@
 // gameConfig.js — 集中配置 + 天赋数学（权威单一来源）
-// 被 sim-core.js（relay 权威）与 src/game.js（手机原生主機 hostStep）共同 import，
-// 保证两条模拟路径的「基础数值 / 天赋汇率 / 阶梯造价」完全一致，不再手工镜像。
+// 由 sim-core.js（relay 权威）与 src/game.js（浏览器客户端）共同 import，
+// 作为「基础数值 / 天赋汇率 / 阶梯造价」的单一真源——两处 import 同一份，完全一致，无需手工镜像。
 //
 // 命名惯例（见需求文档附录）：CATEGORY_key，如 COMBAT_baseDamage、TALENT_costTable。
 // ⚠️ 默认值 = 上线前已调好手感的原硬编码值（勿凭文档占位值改动，防止破坏现有丝滑手感与
