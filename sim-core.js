@@ -452,7 +452,9 @@ export class Sim {
   }
 
   _spawnZombie() {
-    const S = MAP - 1;
+    const ZR = 0.9;                       // 僵尸碰撞/视觉半宽（与 map-core.ZR 保持一致）
+    const ZEDGE = MAP - 1 - ZR - 0.3;     // 生成边距：保证僵尸整只(半宽 ZR)落在围墙内面(37.5)之内，不再穿模
+    const S = ZEDGE;
     const edge = Math.floor(Math.random() * 4);
     let x, z;
     if (edge === 0) { x = -S + Math.random() * 2 * S; z = -S; }

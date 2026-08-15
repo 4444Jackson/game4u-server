@@ -126,16 +126,15 @@ export function moveCircle(obs, px, pz, nx, nz, r, y = 0) {
       if (d2 < r * r) {
         let nx, nz, p;
         if (d2 < 1e-9) {
-          // 圆心恰在障碍矩形内（零法线退化，正常逐帧步进不会触发）：用来源方向(px,pz)推回来源侧，避免穿墙
-          if (Math.abs(px - o.x) >= Math.abs(pz - o.z)) {
-            nx = (px <= o.x) ? -1 : 1; nz = 0;
-            const edge = (px <= o.x) ? (o.x - o.w / 2) : (o.x + o.w / 2);
-            p = Math.abs(x - edge) + r;
-          } else {
-            nx = 0; nz = (pz <= o.z) ? -1 : 1;
-            const edge = (pz <= o.z) ? (o.z - o.d / 2) : (o.z + o.d / 2);
-            p = Math.abs(z - edge) + r;
-          }
+          // 圆心恰在障碍矩形内（零法线退化）：推向【最近的面】(而非来源侧/地图中心)，
+          // 否则圆心深嵌时会朝中心来回拉锯、卡在障碍正中央。
+          const dL = x - (o.x - o.w / 2), dR = (o.x + o.w / 2) - x;
+          const dD = z - (o.z - o.d / 2), dU = (o.z + o.d / 2) - z;
+          const m = Math.min(dL, dR, dD, dU);
+          if (m === dL) { nx = -1; nz = 0; p = dL + r; }
+          else if (m === dR) { nx = 1; nz = 0; p = dR + r; }
+          else if (m === dD) { nx = 0; nz = -1; p = dD + r; }
+          else { nx = 0; nz = 1; p = dU + r; }
         } else {
           const d = Math.sqrt(d2);
           p = r - d; nx = ddx / d; nz = ddz / d;
@@ -173,7 +172,15 @@ export function depenetratePlayer(obs, p, r = PLAYER_HW) {
       if (d2 >= r * r) continue;
       let nx, nz, push;
       if (d2 > 1e-9) { const d = Math.sqrt(d2); nx = dx / d; nz = dz / d; push = r - d; }
-      else { const d = Math.hypot(p.x, p.z) || 1; nx = -p.x / d; nz = -p.z / d; push = r; } // 圆心恰在障碍内：朝地图中心(出生留空区)顶出
+      else {
+        // 圆心恰在障碍矩形内：推向【最近的面】(而非地图中心)，否则深嵌时会卡在障碍正中央来回拉锯
+        const dL = p.x - minx, dR = maxx - p.x, dD = p.z - minz, dU = maxz - p.z;
+        const m = Math.min(dL, dR, dD, dU);
+        if (m === dL) { nx = -1; nz = 0; push = dL + r; }
+        else if (m === dR) { nx = 1; nz = 0; push = dR + r; }
+        else if (m === dD) { nx = 0; nz = -1; push = dD + r; }
+        else { nx = 0; nz = 1; push = dU + r; }
+      }
       if (push > bpush) { bx = nx * push; bz = nz * push; bpush = push; }
     }
     if (bpush <= 0) break;
