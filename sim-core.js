@@ -87,7 +87,7 @@ export class Sim {
       //   置 0：离线 / 阵亡 / 开局 / 回等待房；置 1：本人点「✔ 配好了」。
       //   两处用途共用同一位：① 天赋面板要不要弹（0 就弹）② 对战能不能开局（在线者全 1 才行）
       ready: 0,
-      lives: 1, respawnCd: 0,   // 对战模式：剩余命数 / 死亡重生倒计时
+      lives: 1, deaths: 0, respawnCd: 0,   // 对战模式：剩余命数 / 已死次数 / 死亡重生倒计时
       input: { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false },
       cmdQueue: [], lastAckSeq: 0, useCmdStream: false,   // 指令流：未消费队列 / 已确认序号 / 是否指令驱动
       fireCd: 0, kills: 0,
@@ -231,9 +231,9 @@ export class Sim {
       p.radius = PLAYER_OBS_R * st.scale;
       p.maxHp = this.config.COMBAT.baseHP;
       p.hp = p.maxHp;
-      // 命数 = 基础 + 天赋命数加成；基础 0 = 无限命（天赋加成无意义，保持 0 标记无限）
+      // 命数 = 基础 + 天赋命数加成（deaths=0）；基础 0 = 无限命（天赋加成无意义，保持 0 标记无限）
+      p.deaths = 0;   // 新一局：已死次数清零
       p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
-      p._extraLives = st.extraLives;   // 记录已应用的额外命数，复活时只补增量
       p.out = false;            // 新一局：所有人清空出局标记
       p.ready = 0;              // 新一局：标志位全清（下次回等待房/阵亡时重新弹面板要求重配）
       p.respawnCd = 0;
@@ -302,9 +302,13 @@ export class Sim {
       p.lives = 0;
       p.respawnCd = (this.config.ROOM.respawnTime) || DEFAULT_RESPAWN;     // 无限命：死亡后重生，不扣命，永不 out
     } else {
-      p.lives -= 1;
-      if (p.lives > 0) p.respawnCd = (this.config.ROOM.respawnTime) || DEFAULT_RESPAWN;
-      else { p.lives = 0; p.out = true; p.respawnCd = 0; }
+      // 诚实模型：remaining = 基础命 + 天赋命 − 已死次数(deaths)；deaths 只增不减，永不退还/漏算
+      const st = computeStats(this.config, p.talent);
+      p.deaths = (p.deaths || 0) + 1;
+      const remaining = this.state.livesMax + st.extraLives - p.deaths;
+      p.lives = Math.max(0, remaining);
+      if (remaining > 0) p.respawnCd = (this.config.ROOM.respawnTime) || DEFAULT_RESPAWN;
+      else { p.out = true; p.respawnCd = 0; }   // 命数耗尽：永久出局
     }
   }
 
@@ -662,17 +666,18 @@ export class Sim {
           const st = computeStats(this.config, p.talent);
           p.stats = st;
           p.radius = PLAYER_OBS_R * st.scale;
-          // 命数随天赋「命数」等级增量同步：只补 delta(本次−上次应用)，不重复加也不漏加；
-          // 晚加入者首复活时 _extraLives 未设(=0)，delta=当前天赋命数→自动补足，与开局玩家一致。
-          // 无限命(livesMax===0)恒为 0 标记。
-          const cap = (s.livesMax || 0) + st.extraLives;
+          // 诚实模型命数：remaining = 基础命 + 当前天赋命 − 已死次数(deaths，死亡时+1、此处不动)。
+          // 复活窗口重配天赋→预算实时变：调高则剩余涨（不重复加），调低则剩余降（该少就少）。
+          // 若重配后 remaining<=0 → 直接出局，绝不「0 命复活」。无限命(livesMax===0)恒为 0 标记。
           if (s.livesMax === 0) {
             p.lives = 0;
           } else {
-            const delta = st.extraLives - (p._extraLives || 0);
-            p.lives = Math.min(p.lives + Math.max(0, delta), cap);
+            p.lives = Math.max(0, s.livesMax + st.extraLives - p.deaths);
+            if (p.lives <= 0) {   // 重配天赋后命数耗尽：出局，不复活
+              p.out = true; p.alive = false; p.respawnCd = 0;
+              continue;
+            }
           }
-          p._extraLives = st.extraLives;
           p.hp = p.maxHp; p.alive = true;
           p.y = 0; p.vy = 0; p.grounded = true;
           p.jumpBuf = 0; p.coyoteT = 0;

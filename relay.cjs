@@ -260,7 +260,8 @@ function parseFrame(data) {
       if (room.sim.state.status === 'playing') {
         const sp = room.sim.state.players[cid];
         sp.alive = false;
-        sp.lives = room.sim.state.livesMax;   // 0 = 无限命（首次复活按当前天赋增量补算，见 sim-core 复活段）
+        sp.deaths = 0;   // 晚加入：新人尚未死亡，已死次数清零（首复活按当前天赋重算剩余命，见 sim-core 复活段）
+        sp.lives = room.sim.state.livesMax;   // 0 = 无限命（首复活按当前天赋增量补算，见 sim-core 复活段）
         sp.respawnCd = (room.sim.config.ROOM.respawnTime) || 2.5;
         sp.out = false;
       }

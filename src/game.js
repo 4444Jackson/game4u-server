@@ -366,7 +366,7 @@ export class Game {
       // ready: 天赋"配好没配好"的唯一标志位（镜像 sim-core）。0=没配/要重配，1=配好了。
       //   置 0：离线 / 阵亡 / 开局 / 回等待房；置 1：点「✔ 配好了」
       ready: 0,
-      lives: 1, respawnCd: 0,   // 对战模式：剩余命数 / 死亡重生倒计时
+      lives: 1, deaths: 0, respawnCd: 0,   // 对战模式：剩余命数 / 已死次数 / 死亡重生倒计时
       input: { mx: 0, mz: 0, ax: 0, az: 0, pitch: 0, fire: false, jump: false }, fireCd: 0, kills: 0,
       talent: { atk: 0, def: 0, spd: 0, size: 0, lives: 0 },  // 天赋等级（开局前由玩家分配）
       stats: null,   // 派生实战数值（startGame 时按 config+talent 计算）
@@ -424,7 +424,8 @@ export class Game {
       p.radius = PLAYER_OBS_R * st.scale;
       p.maxHp = this.config.COMBAT.baseHP;
       p.hp = p.maxHp;
-      // 命数 = 基础 + 天赋命数加成；基础 0 = 无限命（保持 0 标记，天赋加成不参与）
+      // 命数 = 基础 + 天赋命数加成（deaths=0）；基础 0 = 无限命（保持 0 标记，天赋加成不参与）
+      p.deaths = 0;   // 新一局：已死次数清零
       p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
       p.out = false;            // 新一局：所有人清空出局标记
       p.ready = 0;              // 新一局：标志位全清（镜像 sim-core.startGame）
@@ -456,9 +457,13 @@ export class Game {
       p.lives = 0;
       p.respawnCd = RESPAWN_TIME;     // 无限命：死亡后重生，不扣命，永不 out
     } else {
-      p.lives -= 1;
-      if (p.lives > 0) p.respawnCd = RESPAWN_TIME;
-      else { p.lives = 0; p.out = true; p.respawnCd = 0; }
+      // 诚实模型（镜像 sim-core）：remaining = 基础命 + 天赋命 − 已死次数(deaths)；deaths 只增不减
+      const st = computeStats(this.config, p.talent);
+      p.deaths = (p.deaths || 0) + 1;
+      const remaining = this.state.livesMax + st.extraLives - p.deaths;
+      p.lives = Math.max(0, remaining);
+      if (remaining > 0) p.respawnCd = RESPAWN_TIME;
+      else { p.out = true; p.respawnCd = 0; }   // 命数耗尽：永久出局
     }
   }
 
