@@ -5,7 +5,7 @@
 // 由 relay 与浏览器客户端各自 import——不存在"镜像 / 手工同步"另一份模拟。
 
 import {
-  MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,
+  MAP, STEP, genObstacles, obbOverlap, buildGrid,
   stepPlayerPhysics,
   bulletWorld, pickZombieKind, ZSTAT, stepZombie
 } from './map-core.js';

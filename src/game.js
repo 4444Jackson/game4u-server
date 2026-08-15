@@ -656,8 +656,8 @@ export class Game {
     this.predInput = inp;
   }
 
-  // 每渲染帧本地模拟自己的移动/跳跃——与 sim-core.step 玩家段逐行同构（同一套 map-core 碰撞）
-  // 固定步长预测：累加真实帧时间，按 1/60 步进，与服务器同口径 → 碰撞解算一致，不再发散。
+  // 每渲染帧本地模拟自己的移动/跳跃——与服务器共用同一份 map-core.stepPlayerPhysics（单一真源，结构上不可能漂移，L2）
+  // 固定步长预测：累加真实帧时间，按 1/60 步进，与服务器同一份物理 → 碰撞解算一致，不再发散。
   // 每帧最多追 5 步（防卡顿/切后台后的螺旋死亡），多余时间丢弃。
   predictTick(realDt) {
     const FIXED = 1 / 60;
@@ -733,7 +733,7 @@ export class Game {
   }
 
   // 确定性单步：用一条指令推进一份预测状态（预测与回滚重放共用同一函数 → 逐位一致）。
-  // 与 sim-core._stepPlayerOnce 逐行同构——统一委托 map-core.stepPlayerPhysics（同一份真源，不可能漂移，L2）。
+  // 统一委托 map-core.stepPlayerPhysics（与 sim-core._stepPlayerOnce 同一份真源，不可能漂移，L2）。
   _stepPredCmd(pr, cmd, dt, sp) {
     if (cmd.jump) pr.jumpBuf = JUMP_BUFFER;   // 与服务器 queueCmds→step 的武装时机一致
     const myStats = computeStats(this.config, sp.talent);
