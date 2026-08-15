@@ -6,6 +6,7 @@
 
 import {
   MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,
+  stepPlayerPhysics,
   bulletWorld, pickZombieKind, ZSTAT, stepZombie
 } from './map-core.js';
 import { makeConfig, computeStats, talentTotalCost } from './gameConfig.js';
@@ -513,55 +514,19 @@ export class Sim {
     this._stepWorld(dt);
   }
 
-  // 单玩家一步物理（移动/跳跃/瞄准/开火）。指令流与状态式共用，保证同口径。
+  // 单玩家一步物理（移动/跳跃/瞄准/开火）。统一委托 map-core.stepPlayerPhysics——
+  // 与客户端预测共用同一份真源，结构上不可能漂移（L2：收敛 case-by-case 补丁为单一逻辑）。
   _stepPlayerOnce(p, inp, dt, obs, FIRE_INTERVAL, PLAYER_SPEED, JUMP_V) {
-    {
-      let mx = inp.mx, mz = inp.mz;
-      const ml = Math.hypot(mx, mz);
-      if (ml > 1) { mx /= ml; mz /= ml; }
-      // 移动方向直接取输入瞄准向量(ax/az)，与客户端预测同口径；
-      // 注意：p.aim 在本步末尾(下方)才从输入更新，若这里用 p.aim 会是「上一 tick 的朝向」(陈旧 1 步)，
-      // 转向时客户端用当前 yaw、服务器用旧 yaw → 圆形走位路径持续错位 → 撞障碍角被顶反方向 → 发散 20m+。
-      const aimX = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3) ? inp.ax : Math.sin(p.aim);
-      const aimZ = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3) ? inp.az : Math.cos(p.aim);
-      const sa = aimX, ca = aimZ;
-      const fwd = -mz, strafe = mx;
-      const dx = fwd * sa - strafe * ca;
-      const dz = fwd * ca + strafe * sa;
-      const spd = PLAYER_SPEED(p);
-      const nx = clamp(p.x + dx * spd * dt, -MAP + 1, MAP - 1);
-      const nz = clamp(p.z + dz * spd * dt, -MAP + 1, MAP - 1);
-      // 体积/移动碰撞：圆柱（半径=PLAYER_OBS_R×受击面积缩放，旋转无关、贴墙顺滑）；伤害判定另用 obbOverlap 严格方块
-      const mv = moveCircle(obs, p.x, p.z, nx, nz, p.radius, p.y);
-      p.x = mv.x; p.z = mv.z;
-      // 垂直：支撑面 = 脚下障碍物顶面(或地面 0)；跳跃/走出边缘自然下落。
-      // 支撑判定半径随玩家碰撞半径缩放（恒 < 半径），否则缩小体型者贴墙会被误判"站在顶面"瞬移上顶。
-      const sup = topAt(obs, p.x, p.z, Math.min(SUPPORT_R, p.radius * 0.5));
-      // 跳跃缓冲 + 土狼时间：grounded 时刷新 coyote；离地后 coyote 倒计时；缓冲在落地/coyote 窗口内才起跳
-      if (p.grounded) p.coyoteT = COYOTE;
-      else if (p.coyoteT > 0) p.coyoteT -= dt;
-      if (p.jumpBuf > 0 && (p.grounded || p.coyoteT > 0)) {
-        p.vy = JUMP_V; p.grounded = false; p.jumpBuf = 0; p.coyoteT = 0;
-      } else if (p.jumpBuf > 0) {
-        p.jumpBuf -= dt;   // 仍悬空：缓冲倒计时，落地瞬间触发起跳（不丢跳）
-      }
-      if (p.grounded && p.y > sup + 0.01) p.grounded = false;   // 走出箱顶边缘 → 下落
-      if (!p.grounded) {
-        p.vy -= GRAVITY * dt;
-        p.y += p.vy * dt;
-        if (p.y <= sup && p.vy <= 0) { p.y = sup; p.vy = 0; p.grounded = true; }
-      } else {
-        p.y = sup;
-      }
-      // 落地/移动兜底去穿透：若落点在障碍里(空中飘入窄缝)，沿最小平移向量顶出，杜绝伪卡死
-      depenetratePlayer(obs, p, p.radius);
-      if (Math.hypot(inp.ax, inp.az) > 0.15) p.aim = Math.atan2(inp.ax, inp.az);
-      p.fireCd -= dt;
-      if (inp.fire && p.fireCd <= 0) {
-        p.fireCd = FIRE_INTERVAL;
-        this._spawnBullet(p);
-      }
-    }
+    stepPlayerPhysics(p, inp, dt, obs, {
+      spd: PLAYER_SPEED(p),
+      radius: p.radius,
+      supR: Math.min(SUPPORT_R, p.radius * 0.5),
+      jumpV: JUMP_V,
+      gravity: GRAVITY,
+      coyote: COYOTE,
+      fireInterval: FIRE_INTERVAL,
+      onFire: (pp) => this._spawnBullet(pp),
+    });
   }
 
   // 世界模拟（子弹/僵尸/重生/胜负）——与玩家步进解耦，每 tick 恒跑一次

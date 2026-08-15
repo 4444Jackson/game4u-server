@@ -189,6 +189,51 @@ export function depenetratePlayer(obs, p, r = PLAYER_HW) {
   }
 }
 
+// ---------------- 玩家单步物理（客户端预测 & 服务器权威共用同一份）----------------
+// 抽出来的唯一目的：客户端/服务器各写一份 _stepPlayerOnce 会随常量/口径漂移（本次"缩小玩家贴障碍闪烁"
+// 正是客户端写死 SUPPORT_R=0.25、服务器随半径缩放 min(SUPPORT_R,r*0.5) 导致预测与权威每帧打架）。
+// 统一到这一份后，漂移类补丁从结构上消失；任何物理改动只改这里，两侧自动一致。
+//   inp: {mx,mz,ax,az,fire}；jump 已由调用方武装进 p.jumpBuf（边沿只武装一次，与权威队列时机一致）
+//   opts:{ spd, radius, supR, jumpV, gravity, coyote, fireInterval, onFire? }
+//     - supR 必须由调用方传 min(SUPPORT_R, radius*0.5)（随半径缩放、恒<半径），两侧用同一公式 → 必然一致
+//     - onFire(p): 权威侧生成子弹(this._spawnBullet)；预测侧不传 → 不开火（子弹由服务器权威同步）
+const LAND_SNAP = 0.5;   // 顶面贴附容差：grounded 且与顶面高度差 < 此值才贴顶；否则视为在更高障碍侧面，不瞬移上顶（防贴边弹上顶/闪烁）
+export function stepPlayerPhysics(p, inp, dt, obs, opts) {
+  const { spd, radius, supR, jumpV, gravity, coyote, fireInterval, onFire } = opts;
+  let mx = inp.mx || 0, mz = inp.mz || 0;
+  const ml = Math.hypot(mx, mz);
+  if (ml > 1) { mx /= ml; mz /= ml; }
+  // 方向取指令 ax/az（重放/预测用"当时"朝向，不混用陈旧 p.aim）；ax/az 接近 0 时回退 sin/cos(p.aim)，与权威一致
+  const aimLive = (Math.abs(inp.ax) + Math.abs(inp.az) > 1e-3);
+  const sa = aimLive ? inp.ax : Math.sin(p.aim);
+  const ca = aimLive ? inp.az : Math.cos(p.aim);
+  const fwd = -mz, strafe = mx;
+  const dx = fwd * sa - strafe * ca;
+  const dz = fwd * ca + strafe * sa;
+  const nx = clampv(p.x + dx * spd * dt, -MAP + 1, MAP - 1);
+  const nz = clampv(p.z + dz * spd * dt, -MAP + 1, MAP - 1);
+  // 体积/移动：圆柱（旋转无关、贴墙顺滑）——伤害判定另用 obbOverlap 严格方块，互不耦合
+  const mv = moveCircle(obs, p.x, p.z, nx, nz, radius, p.y);
+  p.x = mv.x; p.z = mv.z;
+  // 竖直支撑：脚下障碍顶（含边角余量 supR）
+  const sup = topAt(obs, p.x, p.z, supR);
+  if (p.grounded) p.coyoteT = coyote; else if (p.coyoteT > 0) p.coyoteT -= dt;
+  if (p.jumpBuf > 0 && (p.grounded || p.coyoteT > 0)) { p.vy = jumpV; p.grounded = false; p.jumpBuf = 0; p.coyoteT = 0; }
+  else if (p.jumpBuf > 0) p.jumpBuf -= dt;   // 仍悬空：缓冲倒计时，落地瞬间触发起跳（不丢跳）
+  if (p.grounded) {
+    if (p.y > sup + 0.01) p.grounded = false;                 // 走出顶边 → 下落
+    else if (Math.abs(sup - p.y) < LAND_SNAP) p.y = sup;      // 已在顶面附近 → 贴顶（含边角余量，防走下边缘突坠）
+    // else: grounded 在地面、贴着更高障碍的侧面 → 不瞬移上顶（统一前 p.y=sup 会弹上顶、与权威漂移闪烁）
+  } else {
+    p.vy -= gravity * dt; p.y += p.vy * dt;
+    if (p.y <= sup && p.vy <= 0) { p.y = sup; p.vy = 0; p.grounded = true; }
+  }
+  depenetratePlayer(obs, p, radius);                          // 落地/移动兜底去穿透：窄缝飘入也顶出，杜绝伪卡死
+  if (Math.hypot(inp.ax, inp.az) > 0.15) p.aim = Math.atan2(inp.ax, inp.az);
+  p.fireCd -= dt;
+  if (inp.fire && p.fireCd <= 0) { p.fireCd = fireInterval; if (onFire) onFire(p); }
+}
+
 // ---------------- 视线（线段 vs AABB，2D 俯视 + 高度过滤）----------------
 export function hasLOS(obs, x1, z1, x2, z2, eyeY = 1.1) {
   for (const o of obs) {

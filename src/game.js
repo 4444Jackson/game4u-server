@@ -2,8 +2,8 @@
 import * as THREE from 'three';
 // 地形/碰撞/视线/寻路/僵尸AI 等共享逻辑来自 map-core.js，与权威端(relay) import 同一份，无需手工镜像。
 import {
-  MAP, STEP, genObstacles, topAt, moveCircle, depenetratePlayer, obbOverlap, buildGrid,
-  bulletWorld, pickZombieKind, ZSTAT, stepZombie
+  MAP, STEP, genObstacles, obbOverlap, buildGrid,
+  bulletWorld, pickZombieKind, ZSTAT, stepZombie, stepPlayerPhysics
 } from '../map-core.js';
 import { makeConfig, computeStats, talentTotalCost } from '../gameConfig.js';
 
@@ -733,50 +733,21 @@ export class Game {
   }
 
   // 确定性单步：用一条指令推进一份预测状态（预测与回滚重放共用同一函数 → 逐位一致）。
-  // 与 sim-core._stepPlayerOnce 玩家段逐行同构（同一套 map-core 碰撞 / gameConfig 数值）。
+  // 与 sim-core._stepPlayerOnce 逐行同构——统一委托 map-core.stepPlayerPhysics（同一份真源，不可能漂移，L2）。
   _stepPredCmd(pr, cmd, dt, sp) {
     if (cmd.jump) pr.jumpBuf = JUMP_BUFFER;   // 与服务器 queueCmds→step 的武装时机一致
-    let mx = cmd.mx || 0, mz = cmd.mz || 0;
-    const ml = Math.hypot(mx, mz);
-    if (ml > 1) { mx /= ml; mz /= ml; }
-    // 方向取指令里的 ax/az（重放时用"当时"的朝向，而非现在的相机）——与服务器同口径
-    const sa = cmd.ax, ca = cmd.az;
-    const fwd = -mz, strafe = mx;
-    const dx = fwd * sa - strafe * ca;
-    const dz = fwd * ca + strafe * sa;
-    const obs = this.state.obstacles || [];
-    // 移速/半径/跳跃力全部与权威同口径（config 随快照同步；天赋加成用快照里自己的 talent 派生）——
-    // 任何一项不一致都会导致预测发散 → 重放偏差，绝不许硬编码
     const myStats = computeStats(this.config, sp.talent);
-    const spd = myStats.moveSpeed;
     const myR = PLAYER_OBS_R * (sp.scale || myStats.scale || 1);
-    const nx = clamp(pr.x + dx * spd * dt, -MAP + 1, MAP - 1);
-    const nz = clamp(pr.z + dz * spd * dt, -MAP + 1, MAP - 1);
-    const mv = moveCircle(obs, pr.x, pr.z, nx, nz, myR, pr.y);
-    pr.x = mv.x; pr.z = mv.z;
-    // 支撑判定半径必须与服务器同口径（随碰撞半径缩放，恒<半径）：
-    // 否则缩小体型者贴墙时，客户端用固定 SUPPORT_R=0.25 误判"站在顶面"瞬移上顶(y=1.5)，
-    // 而服务器用 min(0.25, r*0.5)=0.06 判定在地面(y=0) → 预测与权威每帧不一致 → 侧边中等高度处闪烁。
-    //（用户实测：缩放到最小、贴近障碍时必现；正常体型两侧一致故不闪。）这是客户端预测唯一的竖直支撑差异点。
-    const sup = topAt(obs, pr.x, pr.z, Math.min(SUPPORT_R, myR * 0.5));
-    // 跳跃缓冲 + 土狼时间（与服务器 step 完全同口径 → 起跳时机一致，不发散）
-    if (pr.grounded) pr.coyoteT = COYOTE;
-    else if (pr.coyoteT > 0) pr.coyoteT -= dt;
-    if (pr.jumpBuf > 0 && (pr.grounded || pr.coyoteT > 0)) {
-      pr.vy = this.config.COMBAT.jumpForce; pr.grounded = false; pr.jumpBuf = 0; pr.coyoteT = 0;
-    } else if (pr.jumpBuf > 0) {
-      pr.jumpBuf -= dt;
-    }
-    if (pr.grounded && pr.y > sup + 0.01) pr.grounded = false;
-    if (!pr.grounded) {
-      pr.vy -= GRAVITY * dt;
-      pr.y += pr.vy * dt;
-      if (pr.y <= sup && pr.vy <= 0) { pr.y = sup; pr.vy = 0; pr.grounded = true; }
-    } else {
-      pr.y = sup;
-    }
-    // 落地/移动兜底去穿透（与权威模拟一致）：客户端预测落进窄缝也顶出，不卡在本地
-    depenetratePlayer(obs, pr, myR);
+    stepPlayerPhysics(pr, cmd, dt, this.state.obstacles || [], {
+      spd: myStats.moveSpeed,
+      radius: myR,
+      supR: Math.min(SUPPORT_R, myR * 0.5),
+      jumpV: this.config.COMBAT.jumpForce,
+      gravity: GRAVITY,
+      coyote: COYOTE,
+      fireInterval: 1 / this.config.COMBAT.fireRate,
+      onFire: undefined,   // 预测侧不开火：子弹由服务器权威生成并同步
+    });
   }
 
   updateCamera() {
