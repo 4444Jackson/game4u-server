@@ -33,6 +33,13 @@ const EMPTY_EVENTS = [];   // 击杀日志为空时的共享占位（快照只�
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+// 诚实命数模型（唯一真源）：remaining = 基础命(livesMax) + 天赋命(extraLives) − 已死次数(deaths)。
+// deaths 只增不减；无限命(livesMax===0)恒为 0 标记、不参与此公式（由各调用点单独处理）。
+// setTalent / _killPlayer / 复活 / startGame 四处共用——改命数逻辑只动这里，杜绝四处各写一份漂移。
+function livesRemaining(livesMax, extraLives, deaths) {
+  return Math.max(0, livesMax + extraLives - deaths);
+}
+
 export class Sim {
   constructor() {
     this.state = this._emptyState();
@@ -153,6 +160,11 @@ export class Sim {
     const st = computeStats(this.config, p.talent);
     p.stats = st;
     p.radius = PLAYER_OBS_R * st.scale;
+    // 复活窗口 / 等待房配天赋时即时重算剩余命数，消除 HUD 先显示 livesMax（无天赋加成）再跳成含天赋值的跳动。
+    // 复用 livesRemaining 单一真源，与 _killPlayer / 复活 / startGame 同口径。
+    if (this.state.livesMax !== 0 && !p.out && p.state === 1) {
+      p.lives = livesRemaining(this.state.livesMax, st.extraLives, p.deaths || 0);
+    }
   }
 
   // 置"配好了"标志位。玩家点「✔ 配好了」时调用（局内局外同一条路径，不分支）。
@@ -233,7 +245,7 @@ export class Sim {
       p.hp = p.maxHp;
       // 命数 = 基础 + 天赋命数加成（deaths=0）；基础 0 = 无限命（天赋加成无意义，保持 0 标记无限）
       p.deaths = 0;   // 新一局：已死次数清零
-      p.lives = s.livesMax === 0 ? 0 : s.livesMax + st.extraLives;
+      p.lives = s.livesMax === 0 ? 0 : livesRemaining(s.livesMax, st.extraLives, 0);
       p.out = false;            // 新一局：所有人清空出局标记
       p.ready = 0;              // 新一局：标志位全清（下次回等待房/阵亡时重新弹面板要求重配）
       p.respawnCd = 0;
@@ -305,8 +317,8 @@ export class Sim {
       // 诚实模型：remaining = 基础命 + 天赋命 − 已死次数(deaths)；deaths 只增不减，永不退还/漏算
       const st = computeStats(this.config, p.talent);
       p.deaths = (p.deaths || 0) + 1;
-      const remaining = this.state.livesMax + st.extraLives - p.deaths;
-      p.lives = Math.max(0, remaining);
+      const remaining = livesRemaining(this.state.livesMax, st.extraLives, p.deaths);
+      p.lives = remaining;
       if (remaining > 0) p.respawnCd = (this.config.ROOM.respawnTime) || DEFAULT_RESPAWN;
       else { p.out = true; p.respawnCd = 0; }   // 命数耗尽：永久出局
     }
@@ -638,7 +650,7 @@ export class Sim {
           if (s.livesMax === 0) {
             p.lives = 0;
           } else {
-            p.lives = Math.max(0, s.livesMax + st.extraLives - p.deaths);
+            p.lives = livesRemaining(s.livesMax, st.extraLives, p.deaths);
             if (p.lives <= 0) {   // 重配天赋后命数耗尽：出局，不复活
               p.out = true; p.alive = false; p.respawnCd = 0;
               continue;
