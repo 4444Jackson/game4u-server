@@ -784,8 +784,8 @@ export function updateHud(state, myId) {
         if (startWaveBtn) startWaveBtn.disabled = !state.canStart;
       } else {
         // wave 无任何开局门槛（单人开荒合法、不需要配天赋）→ 按钮恒可点。
-        // 这一支以前是缺的：只要按钮曾被对战房置灰（回大厅不重建 DOM，状态跟着人走），
-        // 进 wave 房后就再没人把它放开 → 永远开不了局 → 永远进不到 playing 那条复位分支 → 死锁。
+        // 必须在此显式放开按钮：若它曾被对战房置灰（回大厅不重建 DOM，状态跟着人走），
+        // 进 wave 房后若不放回可点态 → 永远开不了局 → 永远进不到 playing 那条复位分支 → 死锁。
         if (startWaveBtn) startWaveBtn.disabled = false;
       }
     }
