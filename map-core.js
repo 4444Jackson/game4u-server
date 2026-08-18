@@ -154,6 +154,43 @@ export function moveCircle(obs, px, pz, nx, nz, r, y = 0) {
   return { x: clampX(x), z: clampX(z) };
 }
 
+// 轴对齐方块版连续滑动碰撞：与 moveCircle 完全同构的 trace-and-slide，
+// 仅把「圆 vs AABB 最近点」换成「点 vs 膨胀 AABB」(Minkowski 和，精确等价 AABB vs AABB)。
+// 用于【轴对齐、不随转向的实体】(僵尸)：其渲染/受击是半边长 hw 的方块，若移动改用内切圆，
+// 方块角会比圆多外伸 hw*(1-1/√2)≈0.29*hw，斜贴障碍滑行时该角持续插入 → 肉眼「半身穿模」。
+// 用方块口径解算则三者(移动/渲染/受击)完全同口径：穿模恒为 0，且正面贴墙精确相切无间隙
+// （改用外接圆虽也能消穿模，但正面贴墙会留 0.29*hw 间隙，视觉更怪）。
+// 注意：玩家的受击方块【随瞄准旋转】，旋转无关的圆才是正确口径，故玩家仍用 moveCircle。
+export function moveBoxAxis(obs, px, pz, nx, nz, hw, y = 0) {
+  const clampX = (v) => clampv(v, -MAP + 1, MAP - 1);
+  let x = nx, z = nz;
+  for (let iter = 0; iter < 4; iter++) {
+    let hnx = 0, hnz = 0, push = 0;
+    for (const o of obs) {
+      if (y >= o.t * STEP - 0.01) continue;             // 站在顶面之上则不挡（与 moveCircle 同判据）
+      const minx = o.x - o.w / 2 - hw, maxx = o.x + o.w / 2 + hw;
+      const minz = o.z - o.d / 2 - hw, maxz = o.z + o.d / 2 + hw;
+      if (x <= minx || x >= maxx || z <= minz || z >= maxz) continue;   // 未落入膨胀矩形 → 不重叠
+      const dL = x - minx, dR = maxx - x, dD = z - minz, dU = maxz - z;
+      const m = Math.min(dL, dR, dD, dU);              // 沿最小穿透轴推出（AABB 无圆角，法线恒为轴向）
+      let cnx, cnz;
+      if (m === dL) { cnx = -1; cnz = 0; }
+      else if (m === dR) { cnx = 1; cnz = 0; }
+      else if (m === dD) { cnx = 0; cnz = -1; }
+      else { cnx = 0; cnz = 1; }
+      if (m > push) { push = m; hnx = cnx; hnz = cnz; }
+    }
+    if (push <= 0) break;                              // 已不重叠 → 走到目标
+    x += hnx * push; z += hnz * push;                  // 顶出到刚好相切
+    let rx = nx - x, rz = nz - z;                      // 剩余位移投影到碰撞面切线（滑动）
+    const dot = rx * hnx + rz * hnz;
+    rx -= dot * hnx; rz -= dot * hnz;
+    x += rx; z += rz;
+    if (rx * rx + rz * rz < 1e-6) break;               // 切线也走不动（被多面夹死）→ 停在最远可行点
+  }
+  return { x: clampX(x), z: clampX(z) };
+}
+
 // 落地/移动后兜底去穿透(depenetration)：
 // 若玩家圆柱与某障碍重叠(典型：跳起后从空中飘入"障碍↔墙"窄缝再落地，落地只 snap y 不重解碰撞)，
 // 沿最小平移向量把人顶出到刚好不重叠。否则该位置所有方向的移动都会被 moveCircle 判为"仍重叠→回退"，
@@ -422,7 +459,7 @@ export function stepZombie(z, dt, ctx) {
       if (z.wt <= 0) { z.wt = 1.5 + Math.random() * 2; z.wa = Math.random() * Math.PI * 2; }
       const nx = z.x + Math.sin(z.wa) * z.speed * 0.45 * dt;
       const nz = z.z + Math.cos(z.wa) * z.speed * 0.45 * dt;
-      const c = moveCircle(obs, z.x, z.z, nx, nz, ZR, 0);
+      const c = moveBoxAxis(obs, z.x, z.z, nx, nz, ZR, 0);
       z.x = clampv(c.x, -MAP + 1, MAP - 1);
       z.z = clampv(c.z, -MAP + 1, MAP - 1);
       return null;
@@ -430,7 +467,7 @@ export function stepZombie(z, dt, ctx) {
   }
   const nx = z.x + Math.sin(dir) * z.speed * dt;
   const nz = z.z + Math.cos(dir) * z.speed * dt;
-  const c = moveCircle(obs, z.x, z.z, nx, nz, ZR, 0);
+  const c = moveBoxAxis(obs, z.x, z.z, nx, nz, ZR, 0);
   z.x = clampv(c.x, -MAP + 1, MAP - 1);
   z.z = clampv(c.z, -MAP + 1, MAP - 1);
   if (meleeHit && tp.y < MELEE_Y && z.atkCd <= 0) {
