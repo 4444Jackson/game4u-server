@@ -12,6 +12,8 @@
 // 保证"被标记可走的格子中心，僵尸站上去必然真的可走"；改 1.5 反而采样过度保守且格子数暴涨。
 
 export const MAP = 38;          // 场地半边长
+export const WALL_T = 1;        // 边界墙厚度（src/game.js 建墙 import 同一份 → 视觉墙面与碰撞边界同源，不会各写一份而漂移）
+export const BOUND_INNER = MAP - WALL_T / 2;  // 边界墙内侧面位置(37.5)：任何实体的方块外缘都不得越过它
 export const STEP = 1.5;        // 高度档位：每档 1.5m（单次跳跃最高 ~1.88m → 1 档跳得上，2 档上不去）
 export const MAX_TIER = 4;      // 障碍物最高 4 档 = 6m
 const CENTER_CLEAR = 13;        // 中心出生区留空半径
@@ -22,6 +24,11 @@ const PLAYER_HW = 0.6;  // 玩家碰撞方块半边长（与 sim-core.PLAYER_OBS
 const BULLET_R = 0.12;  // 子弹碰撞方块半边长（与 sim-core.BULLET_RADIUS 一致；可视方块 0.24 见方 → 所见即碰撞）
 
 const clampv = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// 边界夹取：留的余量 = 【实体自身半边长】，使其方块外缘恰与墙内侧面相切（贴边界墙零穿模、零缝隙）。
+// 余量若写成与实体无关的固定值，半边长大于该值的实体(僵尸 0.9)外缘就会越过墙面 → 贴边界墙时半身没入墙内。
+// 边界墙不在 obs 障碍集里(它是场地四边，不参与 trace-and-slide)，故只能靠此处按实体口径夹取。
+const clampBound = (v, half) => clampv(v, -BOUND_INNER + half, BOUND_INNER - half);
 
 // ---------------- 障碍物生成 ----------------
 // 不做「楼梯/掩体」分类模板——只有随机方块，高度取离散档位。
@@ -38,8 +45,8 @@ export function genObstacles(count = 24) {
     const z = snap((Math.random() * 2 - 1) * (MAP - 5));
     const t = 1 + Math.floor(Math.random() * MAX_TIER);   // 高度档 1..4（已离散）
     if (Math.hypot(x, z) < CENTER_CLEAR + Math.max(w, d) / 2) continue;  // 出生区留空
-    // 离墙净距 ≥WALL_CLEAR(3.0m)：墙在 ±38、玩家中心被钳在 ±37，故"墙↔障碍"通道中心可走带
-    // = (MAP-1) - (障碍边缘 + 玩家半径) = 37 - (35.0 + 0.6) = 1.4m > 玩家直径 1.2m，
+    // 离墙净距 ≥WALL_CLEAR(3.0m)：墙内面在 ±37.5、玩家中心被钳在 ±36.9(=BOUND_INNER-0.6)，故"墙↔障碍"通道中心可走带
+    // = 36.9 - (障碍边缘 35.0 + 玩家半径 0.6) = 1.3m > 玩家直径 1.2m，
     // 玩家落进此缝也只会贴一边、绝不会同时贴障碍与墙而卡死（再加 depenetratePlayer 兜底，双保险）。
     if (Math.abs(x) + w / 2 > MAP - WALL_CLEAR || Math.abs(z) + d / 2 > MAP - WALL_CLEAR) continue;
     let ok = true;
@@ -113,7 +120,7 @@ export function circleOverlapObs(obs, x, z, r, y = 0) {
 // 彻底消除旧版「先X后Z分轴回退」在内角/外角处反复回退导致的卡顿/卡脚。最多迭代 4 次处理多障碍。
 // 签名保持不变：玩家/僵尸/本地预测三处调用自动升级，无需改动调用点。
 export function moveCircle(obs, px, pz, nx, nz, r, y = 0) {
-  const clampX = (v) => clampv(v, -MAP + 1, MAP - 1);
+  const clampX = (v) => clampBound(v, r);
   let x = nx, z = nz;
   for (let iter = 0; iter < 4; iter++) {
     // 找当前最嵌(顶出量最大)的障碍
@@ -162,7 +169,7 @@ export function moveCircle(obs, px, pz, nx, nz, r, y = 0) {
 // （改用外接圆虽也能消穿模，但正面贴墙会留 0.29*hw 间隙，视觉更怪）。
 // 注意：玩家的受击方块【随瞄准旋转】，旋转无关的圆才是正确口径，故玩家仍用 moveCircle。
 export function moveBoxAxis(obs, px, pz, nx, nz, hw, y = 0) {
-  const clampX = (v) => clampv(v, -MAP + 1, MAP - 1);
+  const clampX = (v) => clampBound(v, hw);
   let x = nx, z = nz;
   for (let iter = 0; iter < 4; iter++) {
     let hnx = 0, hnz = 0, push = 0;
@@ -221,8 +228,8 @@ export function depenetratePlayer(obs, p, r = PLAYER_HW) {
       if (push > bpush) { bx = nx * push; bz = nz * push; bpush = push; }
     }
     if (bpush <= 0) break;
-    p.x = clampv(p.x + bx, -MAP + 1, MAP - 1);
-    p.z = clampv(p.z + bz, -MAP + 1, MAP - 1);
+    p.x = clampBound(p.x + bx, r);
+    p.z = clampBound(p.z + bz, r);
   }
 }
 
@@ -247,8 +254,8 @@ export function stepPlayerPhysics(p, inp, dt, obs, opts) {
   const fwd = -mz, strafe = mx;
   const dx = fwd * sa - strafe * ca;
   const dz = fwd * ca + strafe * sa;
-  const nx = clampv(p.x + dx * spd * dt, -MAP + 1, MAP - 1);
-  const nz = clampv(p.z + dz * spd * dt, -MAP + 1, MAP - 1);
+  const nx = clampBound(p.x + dx * spd * dt, radius);
+  const nz = clampBound(p.z + dz * spd * dt, radius);
   // 体积/移动：圆柱（旋转无关、贴墙顺滑）——伤害判定另用 obbOverlap 严格方块，互不耦合
   const mv = moveCircle(obs, p.x, p.z, nx, nz, radius, p.y);
   p.x = mv.x; p.z = mv.z;
@@ -429,8 +436,8 @@ export function stepZombie(z, dt, ctx) {
 
   if (z.k === 'flyer') {
     const a = Math.atan2(tp.x - z.x, tp.z - z.z);
-    z.x = clampv(z.x + Math.sin(a) * z.speed * dt, -MAP + 1, MAP - 1);
-    z.z = clampv(z.z + Math.cos(a) * z.speed * dt, -MAP + 1, MAP - 1);
+    z.x = clampBound(z.x + Math.sin(a) * z.speed * dt, ZR);
+    z.z = clampBound(z.z + Math.cos(a) * z.speed * dt, ZR);
     const cruise = Math.max(topAt(obs, z.x, z.z, ZR) + 0.5, tp.y);
     z.y = (z.y || 0) + (cruise - (z.y || 0)) * Math.min(1, 6 * dt);
     if (meleeHit && Math.abs((z.y || 0) - tp.y) < FLYER_ATK_Y && z.atkCd <= 0) {
@@ -460,16 +467,14 @@ export function stepZombie(z, dt, ctx) {
       const nx = z.x + Math.sin(z.wa) * z.speed * 0.45 * dt;
       const nz = z.z + Math.cos(z.wa) * z.speed * 0.45 * dt;
       const c = moveBoxAxis(obs, z.x, z.z, nx, nz, ZR, 0);
-      z.x = clampv(c.x, -MAP + 1, MAP - 1);
-      z.z = clampv(c.z, -MAP + 1, MAP - 1);
+      z.x = c.x; z.z = c.z;                              // 边界已由 moveBoxAxis 内部按 ZR 夹取，不再二次夹取
       return null;
     }
   }
   const nx = z.x + Math.sin(dir) * z.speed * dt;
   const nz = z.z + Math.cos(dir) * z.speed * dt;
   const c = moveBoxAxis(obs, z.x, z.z, nx, nz, ZR, 0);
-  z.x = clampv(c.x, -MAP + 1, MAP - 1);
-  z.z = clampv(c.z, -MAP + 1, MAP - 1);
+  z.x = c.x; z.z = c.z;                                  // 边界已由 moveBoxAxis 内部按 ZR 夹取，不再二次夹取
   if (meleeHit && tp.y < MELEE_Y && z.atkCd <= 0) {
     z.atkCd = 0.8;
     return tp;

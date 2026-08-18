@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 // 地形/碰撞/视线/寻路/僵尸AI 等共享逻辑来自 map-core.js，与权威端(relay) import 同一份，无需手工镜像。
 import {
-  MAP, STEP, genObstacles, obbOverlap, buildGrid,
+  MAP, WALL_T, STEP, genObstacles, obbOverlap, buildGrid,
   bulletWorld, pickZombieKind, ZSTAT, stepZombie, stepPlayerPhysics
 } from '../map-core.js';
 import { makeConfig, computeStats, talentTotalCost } from '../gameConfig.js';
@@ -204,7 +204,7 @@ export class Game {
         for (let x = off; x <= 128; x += 64) { g.beginPath(); g.moveTo(x, r * 32); g.lineTo(x, r * 32 + 32); g.stroke(); }
       }
     }
-    const wallH = 6, t = 1, S = MAP;
+    const wallH = 6, t = WALL_T, S = MAP;
     const mkWall = (w, dpt, x, z) => {
       const tex = new THREE.CanvasTexture(brickCanvas);
       tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
