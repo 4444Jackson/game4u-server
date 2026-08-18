@@ -10,7 +10,7 @@ COPY dist ./dist
 COPY src ./src
 
 ENV PORT=8123 \
-    TICK_HZ=30 \
+    TICK_HZ=60 \
     NODE_ENV=production
 
 EXPOSE 8123

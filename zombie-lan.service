@@ -15,7 +15,7 @@ Type=simple
 WorkingDirectory=/opt/zombie-lan
 ExecStart=/usr/bin/node /opt/zombie-lan/relay.cjs
 Environment=PORT=8123
-Environment=TICK_HZ=30
+Environment=TICK_HZ=60
 Environment=NODE_ENV=production
 Restart=always
 RestartSec=2

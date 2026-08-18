@@ -9,7 +9,7 @@ services:
       - "8123:8123"
     environment:
       - PORT=8123
-      - TICK_HZ=30
+      - TICK_HZ=60
     # 小内存机器保护：异常时最多吃 768M，避免拖垮整机
     deploy:
       resources:
