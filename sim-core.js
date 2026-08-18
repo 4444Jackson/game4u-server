@@ -1,11 +1,10 @@
 // sim-core.js — 纯模拟核心（权威游戏逻辑，无 THREE / 无渲染依赖）
-// 同一份逻辑在 Node 端由 relay.cjs 跑（权威服务器），浏览器端不引用本文件。
 // 由 relay.cjs 作为唯一权威服务器运行；浏览器端不引用本文件。
 // 地形/碰撞等共享逻辑在 map-core.js、配置/天赋数学在 gameConfig.js，均为权威单一来源，
 // 由 relay 与浏览器客户端各自 import——不存在"镜像 / 手工同步"另一份模拟。
 
 import {
-  MAP, STEP, genObstacles, obbOverlap, buildGrid,
+  BOUND_INNER, STEP, genObstacles, obbOverlap, buildGrid,
   stepPlayerPhysics,
   bulletWorld, pickZombieKind, ZSTAT, stepZombie
 } from './map-core.js';
@@ -305,8 +304,8 @@ export class Sim {
   // 击杀一名玩家：无限命(房间 livesMax===0)只进重生倒计时不扣命；否则扣 1 命，仍有命则重生，
   // 命数耗尽 → out=true（永久出局，唯一参与"本局是否结束"的标记）。
   // ⚠️ 无限命判定必须看 livesMax 而不是 p.lives<=0——后者与"有限命刚好扣到 0"二义，
-  //    会让出局者被当成无限命反复重生（历史 bug）。
-  // 「敞开无限玩」= 房主设 命数0 + 限时0，自然永不收场，无需特殊分支（旧 0/0 _isFreePlay 已废除）。
+  //    会让出局者被当成无限命反复重生。
+// 「敞开无限玩」= 房主设 命数0 + 限时0，自然永不收场，无需为它开特殊分支。
   _killPlayer(p) {
     p.alive = false;
     p.ready = 0;   // 阵亡即作废"配好了"：复活窗口内面板自动弹出，可「重装上阵」改配装
@@ -465,8 +464,10 @@ export class Sim {
   }
 
   _spawnZombie() {
-    const ZR = 0.9;                       // 僵尸碰撞/视觉半宽（与 map-core.ZR 保持一致）
-    const ZEDGE = MAP - 1 - ZR - 0.3;     // 生成边距：保证僵尸整只(半宽 ZR)落在围墙内面(37.5)之内，不再穿模
+    const ZR = 0.9;                            // 僵尸碰撞/视觉半宽（与 map-core.ZR 保持一致）
+    // 生成边距按墙内面(BOUND_INNER)倒推、再留 0.3m 余量 → 僵尸整只(半宽 ZR)落在墙内，出生即不嵌墙。
+    // 必须用 BOUND_INNER 而非 MAP：MAP 是墙中心线，拿它减固定余量算出的边距与实体半宽无关，会溢出墙面。
+    const ZEDGE = BOUND_INNER - ZR - 0.3;
     const S = ZEDGE;
     const edge = Math.floor(Math.random() * 4);
     let x, z;

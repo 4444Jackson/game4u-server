@@ -1,30 +1,20 @@
-// game.js — 浏览器客户端：Three.js 渲染 + 本地输入预测（权威模拟只在 relay 的 sim-core.js，本文件不跑权威逻辑）
+// game.js — 浏览器客户端：Three.js 渲染 + 玩家自身的本地输入预测（权威模拟只在 relay 的 sim-core.js，本文件不跑权威逻辑）
 import * as THREE from 'three';
-// 地形/碰撞/视线/寻路/僵尸AI 等共享逻辑来自 map-core.js，与权威端(relay) import 同一份，无需手工镜像。
+// 从 map-core.js 取「渲染 + 玩家预测」所需的共享逻辑：地形生成、边界尺寸、寻路网格、玩家单步物理。
+// 僵尸/子弹/命中由权威端算完随快照下发，客户端只插值渲染、不复算，故既不引入其逻辑、也不镜像其参数
+//（客户端另存一份权威参数，改一处漏另一处就会漂移，表现为预测与权威每帧打架）。
 import {
-  MAP, WALL_T, STEP, genObstacles, obbOverlap, buildGrid,
-  bulletWorld, pickZombieKind, ZSTAT, stepZombie, stepPlayerPhysics
+  MAP, WALL_T, STEP, genObstacles, buildGrid, stepPlayerPhysics
 } from '../map-core.js';
 import { makeConfig, computeStats, talentTotalCost } from '../gameConfig.js';
 
-// ---- 调参 ----
+// ---- 调参（只放客户端渲染/自身预测用得到的；僵尸、子弹、命数等权威参数由服务端持有，此处不镜像）----
 const PLAYER_OBS_R = 0.6;    // 玩家碰撞方块半边长基准（= 可视方块底面 1.2 / 2；OBB 随瞄准转）。实战半径 = 此值 × 受击面积缩放
 const SUPPORT_R = 0.25;      // 站立支撑判定半径（必须 < PLAYER_OBS_R，防止贴墙瞬移上顶）
-const ZOMBIE_RADIUS = 0.9;   // 僵尸碰撞方块半边长（轴对齐，不随转向）
-const BULLET_RADIUS = 0.12;  // 与可视方块 0.24 见方一致（所见即碰撞）
-const BULLET_LIFE = 1.3;
-const BULLET_EYE = 1.6;      // 出膛高度 = 射手脚底 + 1.6（与相机眼睛同高：视角即弹道，无视差）
-const ZOMBIE_SPEED = 4.4;
-const ZOMBIE_DMG = 9;
 const DEFAULT_WAVE_TARGET = 100;  // 僵尸浪潮默认击杀目标（房主可改；0 = 无限/无尽生存）
-const MAX_ZOMBIES = 22;
-const SPAWN_INTERVAL = 1.1;
-const DEFAULT_LIVES = 3;     // 对战模式默认命条数（房主可改；僵尸浪潮固定 1）
-const RESPAWN_TIME = 2.5;    // 死亡后重生倒计时(秒)
 const GRAVITY = 24;          // 重力加速度(m/s²)
 const JUMP_BUFFER = 0.15;    // 跳跃缓冲：按下后记住 0.15s，落地/coyote 窗口内才起跳
 const COYOTE = 0.10;         // 土狼时间：离地后 0.10s 内仍可起跳（走下箱顶边缘不卡）
-const VISUAL_H = 1.8;        // 玩家可视方块高度（用于子弹命中高度判定；随缩放同步）
 
 const PALETTE = [0x4f9bff, 0xff9f43, 0x2ecc71, 0xff5e7e, 0xb56bff, 0x46d6d6];
 
@@ -53,8 +43,6 @@ const DEFAULT_MOD = {
     { size: [0.24, 0.24, 0.24], pos: [0, 0, 0], color: '#fff2a0', emissive: '#ffd000', emissiveIntensity: 1.4 }
   ]}
 };
-
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 export class Game {
   constructor(canvas) {

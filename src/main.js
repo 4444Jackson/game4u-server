@@ -9,7 +9,7 @@ import { GAME_CONFIG, talentCost, talentTotalCost } from '../gameConfig.js';
 // ---- 全局错误可视化（无控制台环境也能看到报错）----
 // 三条规矩，避免它自己变成 bug：
 //   ① 良性拒绝不显示——指针锁/全屏被浏览器策略拒绝是预期内的（冷却期、非用户手势、iOS 不支持），
-//      不是程序错误，却会走 unhandledrejection，以前会在页面顶部挂一条永不消失的红条挡视野。
+//      不是程序错误，却会走 unhandledrejection；不在此拦掉就会在页面顶部挂一条永不消失的红条挡视野。
 //   ② 同一条消息只占一行，重复只累加 ×N，不无限堆高。
 //   ③ 12 秒后自动消失，也可点击立即关掉——调试信息不该永久霸占屏幕。
 const BENIGN_ERR = /pointer\s*lock|exited the lock|requestPointerLock|fullscreen|Permissions check failed|user gesture/i;

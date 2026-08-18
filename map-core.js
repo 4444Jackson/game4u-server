@@ -1,6 +1,7 @@
 // map-core.js — 地图/障碍物/碰撞/视线/寻路/僵尸AI 共享核心（纯逻辑，无渲染依赖）
-// 由 sim-core.js（relay 权威模拟）与 src/game.js（浏览器客户端：渲染 + 本地预测）共同 import，
-// 作为地形/碰撞规则的单一真源——两处 import 同一份，天然一致，无需手工镜像。
+// 作为地形/碰撞规则的单一真源被两侧各自 import，天然一致、无需手工镜像：
+//   - sim-core.js（relay 权威模拟）：全量使用，含僵尸 AI、子弹与命中判定
+//   - src/game.js（浏览器客户端）：只取渲染与玩家自身预测所需的部分（地形/边界/寻路网格/玩家物理）
 //
 // 【坐标系语义（重要，勿误读为"两套坐标系"）】
 // 全项目唯一权威坐标系 = 连续米制浮点 (x, z)。实体位置、碰撞判定、路径点全部用它表达。
@@ -117,8 +118,8 @@ export function circleOverlapObs(obs, x, z, r, y = 0) {
 // 尝试整步位移 (nx,nz)；若与障碍重叠，则沿「最小推出向量」把人顶出到刚好 r 处（圆不嵌入障碍），
 // 再把本步剩余位移沿碰撞面【切线】方向投影继续走——于是贴墙能顺滑滑行、挤进两障碍形成的
 // 内角也不卡脚（多次迭代分别推开各面并各自滑动）。圆 vs AABB：圆天然能滑过锐角，配合滑动投影
-// 彻底消除旧版「先X后Z分轴回退」在内角/外角处反复回退导致的卡顿/卡脚。最多迭代 4 次处理多障碍。
-// 签名保持不变：玩家/僵尸/本地预测三处调用自动升级，无需改动调用点。
+// 刻意不用「先X后Z分轴回退」：那种解法在内角/外角处会反复回退，导致卡顿/卡脚。最多迭代 4 次处理多障碍。
+// 调用方只有玩家（权威物理与客户端预测都经 stepPlayerPhysics）；僵尸是轴对齐方块，走 moveBoxAxis。
 export function moveCircle(obs, px, pz, nx, nz, r, y = 0) {
   const clampX = (v) => clampBound(v, r);
   let x = nx, z = nz;
@@ -234,9 +235,9 @@ export function depenetratePlayer(obs, p, r = PLAYER_HW) {
 }
 
 // ---------------- 玩家单步物理（客户端预测 & 服务器权威共用同一份）----------------
-// 抽出来的唯一目的：客户端/服务器各写一份 _stepPlayerOnce 会随常量/口径漂移（本次"缩小玩家贴障碍闪烁"
-// 正是客户端写死 SUPPORT_R=0.25、服务器随半径缩放 min(SUPPORT_R,r*0.5) 导致预测与权威每帧打架）。
-// 统一到这一份后，漂移类补丁从结构上消失；任何物理改动只改这里，两侧自动一致。
+// 客户端预测与服务器权威必须共用这一份：各写一份会随常量/口径漂移，症状是玩家贴障碍时闪烁
+//（典型成因：一侧写死 SUPPORT_R=0.25、另一侧用随半径缩放的 min(SUPPORT_R, r*0.5)，两边每帧算出不同位置）。
+// 任何物理改动只改这里，两侧自动一致。
 //   inp: {mx,mz,ax,az,fire}；jump 已由调用方武装进 p.jumpBuf（边沿只武装一次，与权威队列时机一致）
 //   opts:{ spd, radius, supR, jumpV, gravity, coyote, fireInterval, onFire? }
 //     - supR 必须由调用方传 min(SUPPORT_R, radius*0.5)（随半径缩放、恒<半径），两侧用同一公式 → 必然一致
@@ -267,7 +268,7 @@ export function stepPlayerPhysics(p, inp, dt, obs, opts) {
   if (p.grounded) {
     if (p.y > sup + 0.01) p.grounded = false;                 // 走出顶边 → 下落
     else if (Math.abs(sup - p.y) < LAND_SNAP) p.y = sup;      // 已在顶面附近 → 贴顶（含边角余量，防走下边缘突坠）
-    // else: grounded 在地面、贴着更高障碍的侧面 → 不瞬移上顶（统一前 p.y=sup 会弹上顶、与权威漂移闪烁）
+    // else: grounded 在地面、贴着更高障碍的侧面 → 不瞬移上顶（无条件 p.y=sup 会把人弹上顶，并与权威漂移闪烁）
   } else {
     p.vy -= gravity * dt; p.y += p.vy * dt;
     if (p.y <= sup && p.vy <= 0) { p.y = sup; p.vy = 0; p.grounded = true; }

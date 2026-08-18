@@ -176,7 +176,7 @@ function parseFrame(data) {
           name: (msg.name || '房间').toString().slice(0, 24),
           mode: msg.mode || 'wave',
           // lives 允许 null = 未指定：startGame 时透传 undefined，让 Sim 按 config.ROOM.baseLives 取默认
-          // （之前 `msg.lives|0` 把未传强转成 0，导致对战 baseLives 配置永远被覆盖成 max(1,0)=1）
+          // （不可简写成 `msg.lives|0`：未传会被强转成 0，使对战 baseLives 配置被覆盖成 max(1,0)=1）
           lives: (msg.lives !== undefined && msg.lives !== null) ? (msg.lives | 0) : null,
           target: (msg.target !== undefined && msg.target !== null) ? (msg.target | 0) : 100,
           bounce: !!msg.bounce,
