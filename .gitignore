@@ -1,0 +1,15 @@
+# ============ Game4U 云服务器 / 电脑局域网版 ============
+# 上传 GitHub 排除项 —— 本地保留不影响（可重建项仅上传时忽略）
+
+# 依赖（运行零依赖，仅 Node 内置模块；node_modules 仅重建前端时用）
+node_modules/
+
+# 前端构建产物（vite build 可重建）
+dist/
+
+# 日志与系统杂物
+*.log
+*.tar.gz
+.DS_Store
+Thumbs.db
+desktop.ini
